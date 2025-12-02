@@ -2,6 +2,8 @@ import os, pdb, sys
 import random
 import torch
 import torch.nn as nn
+from torch import FloatTensor
+from  torch.nn import Module
 import torch.nn.functional as F
 from assets.static_vars import ATTRIBUTE_TOKEN_LEN, MAX_MIXTURE_SIZE, device
 num_to_string = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight"]
@@ -31,13 +33,31 @@ class SoftEmbedding(nn.Module):
     self.soft_prompt = nn.Parameter(init_prompt_value, requires_grad=True).to(device)
     print(f"Initialized soft prompts with dimension {self.soft_prompt.shape}")
 
-  def init_embedding(self, original_emb, n_tokens, init_from_vocab, tokenizer, init_text):
-    """initializes learned embedding
+  def init_embedding(
+      self,
+      original_emb,
+      n_tokens,
+      init_from_vocab: bool,
+      tokenizer,
+      init_text
+      ):
+    """
+    initializes learned embedding
       either from vocab, random initialization or a custom set of init_text
+
+    Args:
+        original_emb:
+        n_tokens:
+        init_from_vocab:
+        tokenizer:
+        init_text:
 
     Returns:
       torch.float: initialized using original schemes
+
+
     """
+
     if init_from_vocab:
       init_embd = self.original_emb.weight[:n_tokens].clone().detach()
       if tokenizer is not None:
@@ -91,7 +111,7 @@ class CausalEmbedding(SoftEmbedding):
       tokens (torch.long): input tokens before encoding
     Returns:
       torch.float: encoding of text concatenated with learned task specifc embedding
-    
+
     Reasoning: During the first pass, we are operating in the encoding phase, so we
       modify the input sequence to use the soft prompt.  In subsequent passes, we are
       now operating in the generation phase, so we just process the tokens normally.
@@ -138,49 +158,141 @@ class Seq2SeqEmbedding(SoftEmbedding):
 
 
 class AttributeAttention(nn.Module):
+  """
+  自定义属性注意力模块（基于线性投影 + 温度系数 + Einstein 求和的注意力机制）
+
+    作用：对输入的嵌入向量（input_embed）做最大池化 + 线性投影 + 层归一化后，与混合特征（mixture）计算注意力分数
+         再通过注意力权重对 mixture 做加权聚合，最终输出聚合后的混合特征。
+    场景：常用于多属性 / 多模态【特征融合】、软提示（Soft Prompt）【权重聚合】等场景。
+    Attributes:
+          attn: 线性投影层。将输入嵌入映射到同维度空间（无偏置，避免引入额外偏移）
+          attn_non_linear: 非线性激活：SiLU（Swish），比 ReLU更 平滑，保留梯度
+          layer_norm: 层归一化。稳定训练，减少内部协变量偏移
+          temperature: 温度系数：调节注意力分布的尖锐程度（值越小，注意力越集中）
+          温度系数：
+              温度↑: 注意力分布更均匀（权重分散）；
+              温度↓: 注意力更集中（权重聚焦少数特征）
+  """
+  attn:Module
+  attn_non_linear:Module
+  layer_norm:Module
+  temperature:float
   def __init__(self, in_dim, temperature):
     super().__init__()
     self.attn = nn.Linear(in_dim, in_dim, bias=False)
     self.attn_non_linear = nn.SiLU()
-    self.layer_norm = nn.LayerNorm(in_dim)
+    self.layer_norm = nn.LayerNorm(in_dim) # 添加非线形，增强表达能力，应在 layer_norm 后使用。不添加激活则是线性投影，表达能力较弱
     self.temperature = temperature
 
-  def forward(self, input_embed, mixture):
+  def forward(
+      self,
+      input_embed: FloatTensor,
+      mixture: FloatTensor
+      ) -> FloatTensor:
+      """
+
+      Args:
+          input_embed: 输入嵌入向量，形状通常为 [seq_len, in_dim]（序列长度 × 特征维度）
+          mixture: 混合特征/候选特征，形状通常为 [batch_size, n_props, in_dim]（批次 × 属性数 × 特征维度）
+                   混合特征（如多属性候选特征、多组软提示权重）
+
+      Returns:
+          torch.float: 注意力加权聚合后的混合特征，形状为 [in_dim] 或 [batch_size, in_dim]
+
+      """
       # First we project the input_embeding into a new space that fits with mixtures
       # We are learning to project the embedding such that multiplication with the mixture
       # produces attention scores
+      # 步骤1：对输入嵌入做全局最大池化（沿序列维度，dim=0）
+      #       max_pool_inputs_embeds 形状：[in_dim]（seq_len维度被池化，仅保留特征维度）
+      #       _ 是最大池化对应的索引，此处无用
+      # 最大池化作用：压缩输入嵌入的序列维度（如 [10, 768] → [768]），提取序列中最具代表性的特征；
+      #             避免序列长度干扰注意力计算，聚焦嵌入的 “全局核心特征”。
       max_pool_inputs_embeds, _ = torch.max(input_embed, 0)
-      x = self.attn(max_pool_inputs_embeds)
-      x = self.layer_norm(x)
+
+      # 步骤2：线性投影 + 层归一化（无激活？代码中注释了SiLU但未使用，需注意）
+      x = self.attn(max_pool_inputs_embeds)  # 投影：[in_dim] → [in_dim]
+      x = self.layer_norm(x)  # 层归一化：稳定特征分布
+      # x = self.attn_non_linear(x)  # 代码中定义了 self.attn_non_linear 但未调用
       # now we get attention scores by mutipling mixture and the projection
       # softmax produces a weighting scheme
+
+      # 步骤3：计算注意力分数（逐元素相乘 + 温度系数缩放）
+      #       mixture 形状 [b, p, d]，x 形状 [d] → 广播为 [b, p, d] 后逐元素乘
+      #       attn_scores 形状：[batch_size, n_props, in_dim]
       attn_scores = (mixture * x) / self.temperature
+
+      # 步骤4：归一化注意力权重（dim=-1: 沿最后一维，最后一维和为 1）
+      # normalized_attn_scores 形状：[batch_size, n_props, in_dim]，最后一维和为1
       normalized_attn_scores = F.softmax(attn_scores, -1)
+
+      # 步骤5：Einstein求和实现注意力加权聚合
+      # 'bpl, bpd -> pd' 含义：
+      #    对 batch 维度求和，对 p（属性）和 d（维度）保留 → 输出 [n_props, in_dim]
+      #    若 mixture 无 batch 维度，输出为 [in_dim]
+      #    b: batch_size，
+      #    p: n_props（属性数）
+      #    l/d: in_dim（特征维度）
       mixture = torch.einsum('bpl, bpd -> pd', normalized_attn_scores, mixture)
       return mixture
 
 class AttributeBottleneck(nn.Module):
+  """
+  带瓶颈层的属性注意力模块（基于「下投影→非线性→上投影」的瓶颈结构 + 注意力加权聚合），
+  核心目标是：对输入嵌入（input_embed）做瓶颈层特征压缩 + 重构，生成注意力权重，
+  再对混合特征（mixture）做跨批次的注意力加权聚合，最终输出聚合后的属性特征。
+  Notes:
+      瓶颈层（down+up 线性层）:通过特征维度压缩减少计算量、增强特征表达能力，是轻量化特征融合的典型设计。
+  """
   def __init__(self, in_dim, hidden_dim, temperature):
     super().__init__()
+    # 1. 瓶颈层下投影：将输入维度 in_dim 压缩到 hidden_dim（无偏置，避免偏移干扰）
     self.attn_W_down = nn.Linear(in_dim, hidden_dim, bias=False)
+    # 2. 瓶颈层上投影：将压缩后的 hidden_dim 重构回 in_dim（恢复原维度）
     self.attn_W_up = nn.Linear(hidden_dim, in_dim, bias=False)
+    # 3. 非线性激活：SiLU（Swish），比 ReLU 更平滑，保留梯度（瓶颈层非线性）
     self.attn_non_linear = nn.SiLU()
+    # 4. 层归一化：稳定训练，减少内部协变量偏移（重构后归一化）
     self.layer_norm = nn.LayerNorm(in_dim)
+    # 5. 温度系数：调节注意力分布的尖锐程度（值越小，注意力越集中）
     self.temperature = temperature
 
   def forward(self, input_embed, mixture):
+      """
+
+      Args:
+          input_embed: 输入嵌入向量，形状 [seq_len, in_dim]（序列长度×特征维度）
+          mixture: 混合特征/候选特征，形状 [batch_size, n_props, in_dim]（批次×属性数×特征维度）
+
+      Returns:
+          注意力加权聚合后的混合特征，形状 [n_props, in_dim]
+
+      """
       # First we project the input_embeding into a new space that fits with mixtures
       # We are learning to project the embedding such that multiplication with the mixture
       # produces attention scores
+      # ========== 步骤1：输入嵌入全局最大池化 ==========
+      # 压缩序列维度（seq_len→1），提取全局核心特征
+      # max_pool_inputs_embeds 形状：[in_dim]
       max_pool_inputs_embeds, _ = torch.max(input_embed, 0)
-      x = self.attn_W_down(max_pool_inputs_embeds)
-      x = self.attn_non_linear(x)
-      x = self.attn_W_up(x)
-      x = self.layer_norm(x)
+      # ========== 步骤2：瓶颈层特征压缩+重构 ==========
+      # 下投影：in_dim → hidden_dim（特征压缩，减少计算）
+      x = self.attn_W_down(max_pool_inputs_embeds)  # [hidden_dim]
+      # 非线性激活：引入非线性表达能力（瓶颈层核心）
+      x = self.attn_non_linear(x)                   # [hidden_dim]
+      # 上投影：hidden_dim → in_dim（特征重构，恢复原维度）
+      x = self.attn_W_up(x)                         # [in_dim]
+      # 层归一化：稳定重构后的特征分布，避免梯度爆炸/消失
+      x = self.layer_norm(x)                        # [in_dim]
       # now we get attention scores by mutipling mixture and the projection
-      # softmax produces a weighting scheme
+      # ========== 步骤3：注意力分数计算与归一化 ==========
+      # 逐元素相乘：mixture [b,p,d] × x [d] → 广播为 [b,p,d]，再除以温度系数
       attn_scores = (mixture * x) / self.temperature
+      # softmax produces a weighting scheme
+      # 归一化：沿最后一维（特征维度）做 softmax，权重和为 1
       normalized_attn_scores = F.softmax(attn_scores, -1)
+      # ========== 步骤4：注意力加权聚合（跨批次） ==========
+      # Einstein求和：对batch维度（b）求和，保留属性（p）和特征维度（d）
       mixture = torch.einsum('bpl, bpd -> pd', normalized_attn_scores, mixture)
       return mixture
 
@@ -188,29 +300,73 @@ class AttributeBottleneck(nn.Module):
 class AttributeConvolution(nn.Module):
   """
   Mixes prompts through convolution
+  基于二维卷积的提示（Prompt）混合模块，
+  核心目标是：对多组软提示（Prompt）张量做卷积操作，将多组提示融合为单一提示张量。相比注意力机制的 “加权聚合”，
+  卷积更擅长捕捉提示间的局部空间关联（把提示组视为 “特征层”，卷积核在提示维度 / Token 维度做滑动计算），
+  适合结构化的提示混合场景。
+
+  Notes:
+      二维卷积的作用:
+         nn.Conv2d 的 4 个维度定义为：[batch, channels, height, width]，对应到本模块：
+             batch：固定为 1（提示组的批次维度）；
+             channels：提示组数（卷积的 “通道” 维度，对应 max_stack_height）；
+             height：每个提示的 Token 长度（ATTRIBUTE_TOKEN_LEN）；
+             width：每个 Token 的嵌入维度（emb_dim）。
+         卷积核（3×3）在 height × width（Token × 嵌入维度）上滑动，捕捉同一提示内不同 Token、同一 Token 不同维度的局部关联；
+           而通道维度的降维（8→4→1）则融合不同提示组的信息，最终输出单通道（单组提示）。
+      常数填充（torch.ones）的设计考量
+          输入提示组数可能小于 max_stack_height（如 8 组最大，实际输入 5 组），未填充部分用 1 填充而非 0 的原因：
+              0: 填充可能导致卷积梯度消失（ReLU 激活下 0 输入无梯度）；
+              1: 填充是弱先验，既不主导特征，又能保证卷积层有有效输入。
   """
   def __init__(self, emb_dim, stack_height=MAX_MIXTURE_SIZE):
     super().__init__()
-    self.emb_dim = emb_dim
-    self.max_stack_height = stack_height
-    self.attr_len = ATTRIBUTE_TOKEN_LEN
+    self.emb_dim = emb_dim                 # 每个 Token 的嵌入维度（如 768）
+    self.max_stack_height = stack_height   # 最大提示组数（卷积输入通道数）
+    self.attr_len = ATTRIBUTE_TOKEN_LEN    # 每个提示的 Token 长度（如 10）
     self.cnn = nn.Sequential(
-        nn.Conv2d(self.max_stack_height, self.max_stack_height // 2, kernel_size = 3, padding = 1),
-        nn.ReLU(),
-        nn.Conv2d(self.max_stack_height // 2, 1, kernel_size = 3, padding = 1),
+        # 卷积1：输入通道=最大提示组数 → 输出通道=最大组数//2，保持特征尺寸不变
+        nn.Conv2d(
+            self.max_stack_height,
+            self.max_stack_height // 2,
+            kernel_size=3,   # 3×3卷积核（在Token×嵌入维度滑动）
+            padding=1        # 填充1 → 卷积后尺寸不变（(H+2P-K)/S +1 = H）
+        ),
+        nn.ReLU(),  # 非线性激活，增强表达能力
+        # 卷积2：输入通道=最大组数//2 → 输出通道=1（融合为单组提示）
+        nn.Conv2d(self.max_stack_height // 2, 1, kernel_size=3, padding=1),
         nn.ReLU()
     )
 
   def forward(self, x):
+    """
+
+    Args:
+        x(FloatTensor): 输入提示张量，形状 [n_prompts, attr_len, emb_dim]
+            - n_prompts：实际输入的提示组数（≤ max_stack_height）
+            - attr_len：每个提示的 Token 长度（固定为ATTRIBUTE_TOKEN_LEN）
+            - emb_dim：每个 Token 的嵌入维度
+    Returns:
+        (FloatTensor): 融合后的单一提示张量，形状 [attr_len, emb_dim]
+
+    """
+    # 步骤1：创建固定尺寸的填充张量（适配卷积输入格式）
+    # 形状：[batch=1, in_channels=max_stack_height, attr_len, emb_dim]
+    # 注：batch维度固定为1，因输入是单批次的提示组；值初始化为1（常数填充）
     padded_tensor = torch.ones((1, self.max_stack_height, ATTRIBUTE_TOKEN_LEN, self.emb_dim)).to(device)
+    # 步骤2：将实际输入提示填充到固定张量中（未填充部分保留为1）
+    # x.shape[0] = 实际提示组数
     padded_tensor[0, :x.shape[0], :, :] = x
+
+    # 步骤3：卷积融合 → 挤压冗余维度
+    # cnn输出形状：[1, 1, attr_len, emb_dim] → squeeze后变为 [attr_len, emb_dim]
     return self.cnn(padded_tensor).squeeze()
 
 
 class AttributeEmbedding(nn.Module):
 
   def __init__(
-      self, args, attributes: list, original_emb: nn.Embedding, num_sets: int=1, 
+      self, args, attributes: list, original_emb: nn.Embedding, num_sets: int=1,
           frozen: bool=False, tokenizer = None, attribute_init_texts = None):
     """ Introduces new custom parameters to represent the attributes
     Args:
@@ -233,7 +389,7 @@ class AttributeEmbedding(nn.Module):
     self.constraints = None
     self.attribute_map = None
     self.attribute_embedding = None
-    
+
     self.mixture_type = args.mixture
     self.model_type = args.model
 
@@ -411,7 +567,7 @@ class AttributeEmbedding(nn.Module):
       _, embed_dim = input_embed.shape
       active_device = input_embed.device
       return torch.empty((0, embed_dim), device=active_device)
-    
+
     if self.multi_attribute and level < 0:
       con_sets, levels = constraint_set, [0,1]
       mixed = [self.embed_constraints(input_embed, cs, lvl) for cs, lvl in zip(con_sets, levels)]
@@ -462,7 +618,7 @@ class AttributeEmbedding(nn.Module):
     elif args.mixture == 'cnn':
       cnn_path = ckpt_path.replace(prompt_file, f"cnn_{prompt_file}")
       previous_embed.cnn_mixture = torch.load(cnn_path)
-    
+
     print(f"Loaded prompt weights from {embedding_path} and {mapping_path}")
     return previous_embed
 
