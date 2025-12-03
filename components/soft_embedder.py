@@ -1,5 +1,7 @@
 import os, pdb, sys
 import random
+from typing import Union, List, Dict
+
 import torch
 import torch.nn as nn
 from torch import FloatTensor
@@ -364,7 +366,18 @@ class AttributeConvolution(nn.Module):
 
 
 class AttributeEmbedding(nn.Module):
-
+  """
+  Attributes:
+      multi_attribute (bool):  是否多属性
+      attribute_map(Union[List[Dict[str, int]], Dict[str, int]]):
+        - List[Dict[str, int]]: 有多个属性时
+        - Dict[str, int]: 只有一个属性时
+  """
+  multi_attribute: bool
+  attention: AttributeAttention
+  bottleneck: AttributeBottleneck
+  cnn_mixture: AttributeConvolution
+  attribute_map: Union[List[Dict[str, int]], Dict[str, int]]
   def __init__(
       self, args, attributes: list, original_emb: nn.Embedding, num_sets: int=1,
           frozen: bool=False, tokenizer = None, attribute_init_texts = None):
@@ -426,7 +439,7 @@ class AttributeEmbedding(nn.Module):
           self.attribute_map.append(attr_map)
           category, attr_init_text = categories[idx], attribute_init_texts[idx]
 
-          init_attr_values = self.initialize_tokens(original_emb, len(attrs), tokenizer, attr_init_text)
+          init_attr_values = self.initialize_tokens(len(attrs), tokenizer, attr_init_text)
           attr_embed = nn.Parameter(init_attr_values, requires_grad=not frozen).to(device)
           self.attribute_embedding.append(attr_embed)
           print(f"Initialized {category} tokens with dimension {attr_embed.shape}")
@@ -435,16 +448,25 @@ class AttributeEmbedding(nn.Module):
         self.num_attributes = len(attributes)
         self.attribute_map = {attr:idx for idx, attr in enumerate(attributes)}
 
-        init_attr_values = self.initialize_tokens(original_emb, len(attributes), tokenizer, attribute_init_texts)
+        init_attr_values = self.initialize_tokens(len(attributes), tokenizer, attribute_init_texts)
         self.attribute_embedding = nn.Parameter(init_attr_values, requires_grad=not frozen).to(device)
         print(f"Initialized attribute tokens with dimension {self.attribute_embedding.shape}")
 
-  def initialize_tokens(self, original_emb, n_attributes, tokenizer=None, attribute_init_texts=None):
-    """initializes learned embedding
+  def initialize_tokens(self, n_attributes, tokenizer=None, attribute_init_texts=None):
+    """
+    initializes learned embedding
     random_range (float, optional): range to init embedding, only applies
       when not initializing from vocab. Defaults to 0.5.
+
+    Args:
+        original_emb:
+        n_attributes: 属性数量
+        tokenizer: 分词器
+        attribute_init_texts: 属性初始化文本
+
     Returns:
-      torch.float: initialized using original schemes
+        (FloatTensor): initialized using original schemes
+
     """
     start, stop = 0, ATTRIBUTE_TOKEN_LEN
     init_embeds = []
