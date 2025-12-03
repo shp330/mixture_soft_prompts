@@ -4,8 +4,8 @@ from typing import Union, List, Dict
 
 import torch
 import torch.nn as nn
-from torch import FloatTensor
-from  torch.nn import Module
+from torch import FloatTensor, Tensor
+from torch.nn import Module, Embedding, Parameter
 import torch.nn.functional as F
 from assets.static_vars import ATTRIBUTE_TOKEN_LEN, MAX_MIXTURE_SIZE, device
 num_to_string = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight"]
@@ -367,45 +367,74 @@ class AttributeConvolution(nn.Module):
 
 class AttributeEmbedding(nn.Module):
   """
+  多策略【属性嵌入】模块，是 AttributeAttention / AttributeBottleneck / AttributeConvolution 的“总控模块”：
+  目的：为不同任务（如 NLU、NER）的 “属性”（意图 / 槽位 / 实体类型等）创建可学习的嵌入向量，
+       并支持三种混合策略（注意力 / 瓶颈层 / 卷积）融合多组属性嵌入；
+  特点：
+      - 支持「单属性 / 多属性」模式（多属性对应意图、槽位等不同属性类型）；
+      - 支持嵌入向量冻结 / 可学习；
+      - 适配不同数据集（nlu++/crossner/topv2）的卷积混合参数；
+      - 支持从文本初始化属性嵌入（结合 Tokenizer）。
   Attributes:
-      multi_attribute (bool):  是否多属性
+      multi_attribute (bool):  是否多属性模式
       attribute_map(Union[List[Dict[str, int]], Dict[str, int]]):
-        - List[Dict[str, int]]: 有多个属性时
-        - Dict[str, int]: 只有一个属性时
+        - List[Dict[str, int]]: 多属性时，每个元素是“属性名→索引”的映射（如意图映射+槽位映射）
+        - Dict[str, int]: 单属性时，“属性名→索引”的映射
+      attention: 注意力属性混合模块（mixture_type='attention'时生效）
+      bottleneck: 瓶颈层属性混合模块（mixture_type='bottleneck'时生效）
+      cnn_mixture: 卷积属性混合模块（mixture_type='cnn'时生效）
   """
   multi_attribute: bool
   attention: AttributeAttention
   bottleneck: AttributeBottleneck
   cnn_mixture: AttributeConvolution
   attribute_map: Union[List[Dict[str, int]], Dict[str, int]]
+
   def __init__(
-      self, args, attributes: list, original_emb: nn.Embedding, num_sets: int=1,
-          frozen: bool=False, tokenizer = None, attribute_init_texts = None):
-    """ Introduces new custom parameters to represent the attributes
+      self,
+      args,
+      attributes: list,
+      original_emb: nn.Embedding,
+      num_sets: int = 1,
+      frozen: bool = False,
+      tokenizer=None,
+      attribute_init_texts: Union[List[List[str]], List[str]] = None
+  ):
+    """
+    初始化属性嵌入模块
+    Introduces new custom parameters to represent the attributes
     Args:
-      args (dict): group of argument flags
-      attributes (list): decides how many unique embeddings to create
-      original_emb (nn.Embedding): to be used when initializing from attribute name
-      num_sets (int): number of attribute sets, if greater than 1 then we are
-        encoding different types of attributes, such as intents and domains
-      frozen (bool): if True, freeze the parameters to their initial encoding
-      tokenizer: a tokenizer for init_text
-      attribute_init_texts (list[str]): list of texts to initialize the attributes from
-        must match the length of attributes
+      args (dict): 配置参数（包含mixture_type、temperature、hidden_size、dataset等）
+      attributes (list): 属性列表，决定创建多少个唯一的属性嵌入（decides how many unique embeddings to create）
+          - 单属性：如 ['intent1', 'intent2', 'intent3']
+          - 多属性：如 [['intent1','intent2'], ['slot1','slot2','slot3']]（意图+槽位）
+      original_emb (nn.Embedding): 原始嵌入层（用于从文本初始化属性嵌入）（to be used when initializing from attribute name）
+      num_sets (int): 属性集数量， >1 时为多属性模式（如1=仅意图，2=意图+槽位）
+         （number of attribute sets, if greater than 1 then we are encoding different types of attributes, such as intents and domains）
+      frozen (bool): 是否冻结属性嵌入参数（True=不更新，False=可学习）（if True, freeze the parameters to their initial encoding）
+      tokenizer: 分词器（用于将初始化文本转为token，进而生成嵌入）（a tokenizer for init_text）
+      attribute_init_texts (Union[List[List[str]], List[str]]): 初始化文本列表 → 长度需匹配attributes
+          - 单属性：如 ['init text for intent', 'init text for intent2']
+          - 多属性：如 [['init text for intent', 'init text for intent2'], ['init text for slot', 'init text for slot2']]
+        （list of texts to initialize the attributes from must match the length of attributes）
     """
     super().__init__()
+    self.pad_lengths = None
     self.name = 'attribute-embedding'
-    self.original_emb = original_emb
-    self.multi_attribute = num_sets > 1
+    self.original_emb = original_emb     # 原始嵌入层（如预训练模型的词嵌入）
+    self.multi_attribute = num_sets > 1  # 判断是否多属性模式
 
-    self.instruction_prompt = None
-    self.constraints = None
-    self.attribute_map = None
-    self.attribute_embedding = None
+    # 初始化空属性（后续根据配置赋值）
+    self.instruction_prompt = None  # 指令提示（预留字段）
+    self.constraints = None         # 约束条件（预留字段）
+    self.attribute_map = None       # 属性名→索引映射
+    self.attribute_embedding = None # 属性嵌入参数（可学习/冻结）
 
-    self.mixture_type = args.mixture
-    self.model_type = args.model
+    self.mixture_type = args.mixture # 混合策略：'attention'/'bottleneck'/'cnn'
+    self.model_type = args.model     # 模型类型（预留字段）
 
+    # ========== 初始化混合策略模块 ==========
+    # 1. 注意力混合
     if self.mixture_type == 'attention':
       self.attention = AttributeAttention(original_emb.weight.size(1), args.temperature)
       self.attention.to(device)
@@ -427,62 +456,92 @@ class AttributeEmbedding(nn.Module):
       )
       self.cnn_mixture.to(device)
 
-    if len(attributes) > 0:
+    # ========== 初始化属性嵌入（核心） ==========
+    if len(attributes) > 0:  # 若属性列表非空
+      # 多属性模式（如意图+槽位）
       if self.multi_attribute:
-        self.attribute_map = []
-        self.attribute_embedding = []
-        categories = ['intent', 'slot']  # Remove to generalize
+        self.attribute_map = []  # 存储多个属性映射（如[意图映射, 槽位映射]）
+        self.attribute_embedding = []  # 存储多个属性嵌入（如[意图嵌入, 槽位嵌入]）
+        categories = ['intent', 'slot']  # # 属性类别（可移除以泛化）（Remove to generalize）
+        # 校验：类别数需等于属性集数量（如意图+槽位=2个属性集）
         assert(len(categories) == len(attributes))
 
+        # 遍历每个属性集（如第一个=意图，第二个=槽位）
         for idx, attrs in enumerate(attributes):
+          # 构建属性名→索引的映射（如{'intent1':0, 'intent2':1}）
           attr_map = {attr:j for j, attr in enumerate(attrs)}
           self.attribute_map.append(attr_map)
+          # 获取当前属性集的类别和初始化文本
           category, attr_init_text = categories[idx], attribute_init_texts[idx]
 
-          init_attr_values = self.initialize_tokens(len(attrs), tokenizer, attr_init_text)
+          # 初始化属性嵌入值（从文本生成）
+          init_attr_values = self.initialize_attribute_tokens(len(attrs), tokenizer, attr_init_text)
+          # 创建可学习/冻结的参数，并同步到设备
           attr_embed = nn.Parameter(init_attr_values, requires_grad=not frozen).to(device)
           self.attribute_embedding.append(attr_embed)
           print(f"Initialized {category} tokens with dimension {attr_embed.shape}")
-
+      # 单属性模式（仅一种属性，如仅意图）
       else:
-        self.num_attributes = len(attributes)
+        self.num_attributes = len(attributes)  # 属性数量
+        # 构建{属性名→索引}的映射
         self.attribute_map = {attr:idx for idx, attr in enumerate(attributes)}
 
-        init_attr_values = self.initialize_tokens(len(attributes), tokenizer, attribute_init_texts)
+        # 初始化属性嵌入值
+        init_attr_values = self.initialize_attribute_tokens(len(attributes), tokenizer, attribute_init_texts)
+        # 创建可学习/冻结的参数
         self.attribute_embedding = nn.Parameter(init_attr_values, requires_grad=not frozen).to(device)
         print(f"Initialized attribute tokens with dimension {self.attribute_embedding.shape}")
 
-  def initialize_tokens(self, n_attributes, tokenizer=None, attribute_init_texts=None):
+  def initialize_attribute_tokens(
+      self,
+      n_attributes: int,
+      tokenizer=None,
+      attribute_init_texts: List[str] = None
+  ) -> Tensor:
     """
-    initializes learned embedding
-    random_range (float, optional): range to init embedding, only applies
-      when not initializing from vocab. Defaults to 0.5.
+    Initializes learned embedding
+    属性嵌入的初始化，支持两种初始化策略（优先级：文本初始化 > 原始嵌入切片）：
+      1. 默认：从原始嵌入层切片（每个属性分配ATTRIBUTE_TOKEN_LEN个连续Token）；
+      2. 可选：用初始化文本的Token嵌入覆盖默认切片，增强语义相关性。
+
+    默认策略：从预训练嵌入层（original_emb）的指定位置切片，为每个属性分配固定长度的 Token 嵌入；
+    文本初始化策略：若传入初始化文本和 Tokenizer，用文本对应的预训练 Token 嵌入覆盖默认切片，让属性嵌入更贴合任务语义
 
     Args:
-        original_emb:
-        n_attributes: 属性数量
-        tokenizer: 分词器
-        attribute_init_texts: 属性初始化文本
+        n_attributes(int): 属性数量（需初始化的嵌入数量）
+        tokenizer: 分词器, 文本初始化时必需
+        attribute_init_texts(List[str]): 属性初始化文本列表
 
     Returns:
-        (FloatTensor): initialized using original schemes
+        (FloatTensor): 初始化的属性嵌入，形状 [n_attributes, ATTRIBUTE_TOKEN_LEN, emb_dim] (initialized using original schemes)
+            - n_attributes：属性数量
+            - ATTRIBUTE_TOKEN_LEN：每个属性的Token长度
+            - emb_dim：原始嵌入层的维度（如768）
 
     """
+    # ========== 步骤1：默认初始化（从原始嵌入层切片） ==========
+    # 切片起始/结束位置（初始为0~ATTRIBUTE_TOKEN_LEN）
     start, stop = 0, ATTRIBUTE_TOKEN_LEN
-    init_embeds = []
+    init_embeds = []  # 存储每个属性的初始嵌入
+    # 遍历每个属性，分配连续的Token嵌入切片
     for _ in range(n_attributes):
+      # 从原始嵌入层切片: 形状 [ATTRIBUTE_TOKEN_LEN, emb_dim]
+      # clone()+detach()：复制张量并脱离计算图（避免修改原始嵌入层权重）
       embed = self.original_emb.weight[start:stop].clone().detach()
       init_embeds.append(embed)
 
+      # 更新切片位置（下一个属性取后续的Token）
       start += ATTRIBUTE_TOKEN_LEN
       stop += ATTRIBUTE_TOKEN_LEN
 
+    # ========== 步骤2：文本初始化（可选，覆盖默认切片） ==========
     if attribute_init_texts:
       if not tokenizer:
         raise ValueError("tokenizer must be provided if attribute_init_texts is provided")
       if n_attributes != len(attribute_init_texts):
         raise ValueError(f"Number of attributes {n_attributes} does not match number of attribute_init_texts")
 
+      # 遍历每个属性，用对应文本的 Token 嵌入覆盖默认切片
       for n in range (n_attributes):
         tokens = tokenizer(attribute_init_texts[n])
         for i, token in enumerate(tokens['input_ids']):
@@ -522,7 +581,23 @@ class AttributeEmbedding(nn.Module):
       return self.original_emb(token_batch)
 
   @staticmethod
-  def repeat_to_fill(descriptions, tokenizer):
+  def repeat_to_fill(
+      descriptions: List[str],
+      tokenizer
+  ) -> List[str]:
+    """
+    将属性描述文本重复填充，确保分词后 Token 数≥ ATTRIBUTE_TOKEN_LEN（属性 Token 长度）
+    用于初始化时让文本 Token 数覆盖属性Token长度，避免替换不充分
+
+    Args:
+        descriptions (List[str]): 属性描述文本列表（如["价格低", "评分高"]）
+        tokenizer:
+
+    Returns:
+        List[str]: 填充后的文本列表
+
+    """
+    # 1. 文本分词，获取每个文本的Token ID（仅用于计算长度）
     desc_embedding = tokenizer(descriptions)['input_ids']
 
     filled = []
@@ -531,9 +606,23 @@ class AttributeEmbedding(nn.Module):
       filled.append( f"{description} " * num_repeats )
     return filled
 
-  def _get_tokens(self, constraint_queries, level):
-    """ given a list of attribute strings written in canonical form, will return a list of the
-    attribute token embeddings for feeding into a model. """
+  def _get_tokens(
+      self,
+      constraint_queries: List[str],
+      level: int,
+  ) -> List[Parameter]:
+    """
+    将属性约束文本（如["价格低"]）映射为对应的属性嵌入向量
+    支持单/多属性模式（multi_attribute）
+    given a list of attribute strings written in canonical form, will return a list of the
+    attribute token embeddings for feeding into a model.
+    Args:
+        constraint_queries: 属性约束文本列表（如["价格低", "评分高"]）
+        level: 多属性模式下的层级（如0=价格层，1=评分层）
+
+    Returns:
+        List[Tensor]: 每个属性对应的嵌入向量，形状为 [ATTRIBUTE_TOKEN_LEN, emb_dim]
+    """
     attribute_embeds = []
     for query in constraint_queries:
       if self.multi_attribute:
@@ -547,19 +636,30 @@ class AttributeEmbedding(nn.Module):
 
   def set_constraints(self, metadata):
     """
+    校验并设置前向传播时使用的属性约束
+    核心：确保约束文本在预定义的属性映射表中（避免无效约束）
     set_constraints that will be used when running a forward pass
     If no constraints are set, only the instruction prompt is used with the domain
     sanity check that constraints are found within self.attribute_map keys.
+
+    Args:
+        metadata (dict): 包含约束和 padding 长度的字典，结构：
+            {
+                "constraints": [[约束列表1], [约束列表2]]（多属性）/ [约束列表]（单属性）,
+                "pad_lengths": 各部分的padding长度（用于对齐维度）
+            }
+
+    Returns:
+
     """
     for constraints in metadata['constraints']:
-
       if self.multi_attribute:
         num_sets = len(constraints)  # should be 2
         for index in range(num_sets):
           for category_constraint in constraints[index]:
+            # 校验：约束文本必须在对应层级的映射表中
             if category_constraint not in self.attribute_map[index].keys():
               raise ValueError(f'Constraint: {category_constraint} not in the mapping')
-
       else:
         # random.shuffle(constraints)  # if you want to shuffle the order
         for constraint in constraints:
@@ -569,37 +669,88 @@ class AttributeEmbedding(nn.Module):
     self.constraints = metadata['constraints']
     self.pad_lengths = metadata['pad_lengths']
 
-  def calc_attribute_length(self, constraint_set, level=-1):
+  def calc_attribute_length(
+      self,
+      constraint_set: Union[List[List[str]], List[str]],
+      level: int = -1
+  ) -> int:
+    """
+    计算属性约束对应的嵌入总长度（用于padding/截断时的维度对齐）
+
+    Args:
+        constraint_set: (List[str]/List[List[str]]): 属性约束集合（单/多属性）
+        level (int): 多属性模式下的层级（-1=自动处理所有层级）
+
+    Returns:
+        int: 属性嵌入的总长度（Token数）
+
+    """
     if len(constraint_set) == 0:
       return 0
 
+    # 多属性模式且未指定层级 → 递归计算所有层级的长度并求和
     if self.multi_attribute and level < 0:
       con_sets, levels = constraint_set, [0,1]
       lengths = [self.calc_attribute_length(cs, lvl) for cs, lvl in zip(con_sets, levels)]
       attr_len = sum(lengths)
     else:
+      # 单属性/指定层级：根据混合模式计算长度
       if self.mixture_type == 'concat':
+        # 拼接模式：多个属性的嵌入直接拼接，总长度 = 属性数 × 单个属性长度
         attr_len = len(constraint_set) * ATTRIBUTE_TOKEN_LEN
       else:
+        # 其他模式（注意力/瓶颈/CNN/池化）：仅保留一个属性的Token长度
         attr_len = ATTRIBUTE_TOKEN_LEN
     return attr_len
 
-  def embed_constraints(self, input_embed, constraint_set, level=-1):
+  def embed_constraints(
+      self,
+      input_embed: Tensor,
+      constraint_set: Union[List[List[str]], List[str]],
+      level: int = -1
+  ) -> torch.Tensor:
+    """
+    获取属性约束的最终嵌入向量：将属性约束转为最终的嵌入向量（核心前向逻辑）
+
+    Args:
+        input_embed (torch.Tensor): 输入嵌入（如指令prompt的嵌入），形状 [seq_len, emb_dim]
+        constraint_set (List[str]/List[List[str]]): 属性约束集合
+        level (int): 多属性模式下的层级（-1=自动处理）
+
+    Returns:
+        torch.Tensor: 属性约束的最终嵌入，形状 [attr_len, emb_dim]
+
+    """
+    # 空约束 → 返回空张量（维度匹配）
     if len(constraint_set) == 0:
       _, embed_dim = input_embed.shape
       active_device = input_embed.device
       return torch.empty((0, embed_dim), device=active_device)
-
+    # 多属性模式且未指定层级 → 递归处理所有层级并拼接
     if self.multi_attribute and level < 0:
       con_sets, levels = constraint_set, [0,1]
       mixed = [self.embed_constraints(input_embed, cs, lvl) for cs, lvl in zip(con_sets, levels)]
       attr_embed = torch.concat(mixed)
     else:
+      # 单属性/指定层级：先映射为属性Token，再执行混合操作
       constraint_tokens = self._get_tokens(constraint_set, level)
       attr_embed = self.mix_operation(constraint_tokens, input_embed)
     return attr_embed
 
   def mix_operation(self, constraint_tokens, input_embed):
+    """
+    多属性嵌入的混合策略（核心：将多个属性嵌入融合为最终向量）
+    流程：属性约束文本 → _get_tokens（映射为原始属性嵌入） → mix_operation（混合为最终嵌入）
+
+    Args:
+        constraint_tokens (List[torch.Tensor]): 多个属性的原始嵌入，每个形状 [ATTRIBUTE_TOKEN_LEN, emb_dim]
+        input_embed (torch.Tensor): 输入嵌入（如prompt），形状 [seq_len, emb_dim]
+
+    Returns:
+        torch.Tensor: 混合后的属性嵌入，形状 [attr_len, emb_dim]
+
+    """
+    # 默认：拼接所有属性嵌入 → 形状 [n_attr×ATTRIBUTE_TOKEN_LEN, emb_dim]
     attr_embed = torch.cat(constraint_tokens)  # (attr_token_len * n, embed_dim)
 
     if self.mixture_type == 'attention':
@@ -619,6 +770,18 @@ class AttributeEmbedding(nn.Module):
 
   @classmethod
   def from_saved_embedding(cls, args, original_emb, ckpt_path):
+    """
+    从保存的文件加载属性嵌入、映射表、混合层权重（断点续训/预加载）
+
+    Args:
+        args:
+        original_emb:
+        ckpt_path (str): 权重文件路径
+
+    Returns:
+
+    """
+    # 无路径 → 返回空实例（冻结嵌入）
     if not ckpt_path:
       return cls(args, [], original_emb, frozen=True)
 
@@ -645,6 +808,16 @@ class AttributeEmbedding(nn.Module):
     return previous_embed
 
   def save_prompt_embedding(self, save_path, filename):
+    """
+    保存属性嵌入、映射表、混合层权重（断点续训/部署）
+
+    Args:
+        save_path (str): 保存目录
+        filename (str): 文件名前缀
+
+    Returns:
+
+    """
     attr_path = os.path.join(save_path, f"attr_vals_{filename}")
     torch.save(self.attribute_embedding, attr_path)
 
