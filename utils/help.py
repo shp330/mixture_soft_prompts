@@ -32,7 +32,9 @@ def setup_gpus(args):
     n_gpu = torch.cuda.device_count()
   args.n_gpu = n_gpu
   if n_gpu > 0:   # this is not an 'else' statement and cannot be combined
+    # 关闭cudnn benchmark（自动调优）：避免不同运行时选择不同算法导致结果不一致
     torch.backends.cudnn.benchmark = False
+    # 开启cudnn确定性计算：强制使用确定性算法，保证相同输入得到相同输出
     torch.backends.cudnn.deterministic = True
   return args
 
