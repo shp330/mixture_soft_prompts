@@ -553,31 +553,53 @@ class AttributeEmbedding(nn.Module):
     return torch.stack(init_embeds)
 
   def forward(self, token_batch):
-    """run forward pass
-    Args:
-      token_batch (torch.long): input tokens before encoding (batch_size x seq_len)
-    Returns:
-      final_embed (torch.float): encoding of text prepended with learned task specifc
-      embeddings of shape (batch_size x seq_len x embed_dim)
     """
+    拼接【软提示+属性约束嵌入】到原始输入前，生成最终模型输入嵌入：
+        1. 训练/推理阶段：拼接指令提示+Padding+属性约束+原始输入；
+        2. 生成阶段：直接返回原始嵌入，禁用软提示。
+    分阶段处理：根据输入 Token 特征判断是否启用「软提示（Soft Prompt）+ 属性约束嵌入」；
+    嵌入拼接：将指令提示嵌入、Padding 嵌入、属性约束嵌入、原始输入嵌入拼接为最终输入；
+    生成阶段兼容：生成阶段直接返回原始嵌入，不使用软提示（避免干扰生成逻辑）。
+    run forward pass
+    Args:
+      token_batch (LongTensor): 编码前的输入Token(input tokens before encoding) (batch_size x seq_len)
+          - Token值 < 0 或 GPT模型且序列长度 > 1 → 启用软提示；
+          - 否则 → 生成阶段，返回原始嵌入。
+    Returns:
+      final_embed (torch.float): 最终输入嵌入, new_seq_len = 指令长度 + Padding长度 + 属性长度 + 原始输入长度
+          encoding of text prepended with learned task specifc embeddings of shape (batch_size x seq_len x embed_dim)
+    """
+    # ========== 条件判断：是否启用软提示 + 属性约束 ==========
+    # 触发条件：
+    # 1. 第一个 Token < 0（自定义标记：表示需要启用软提示）；
+    # 2. 模型为 GPT 且序列长度 > 1（GPT 生成阶段序列长度 = 1，训练/推理阶段 > 1）；
     if token_batch[0][0] < 0 or (self.model_type=='gpt' and token_batch.shape[1] > 1):
-      final_embeddings = []
-      instruct_embed = self.instruction_prompt.soft_prompt
-      instruct_len = self.instruction_prompt.n_tokens
+      final_embeddings = []  # 存储每个样本的最终嵌入
+      # 1. 提取指令提示嵌入和长度（预训练的任务专属软提示）
+      instruct_embed = self.instruction_prompt.soft_prompt  # 形状 [instruct_len, emb_dim]
+      instruct_len = self.instruction_prompt.n_tokens  # 指令提示的Token长度
 
+      # 2. 遍历批次中的每个样本（Token + 约束 + Padding长度）
       for tokens, attributes, pad_len in zip(token_batch, self.constraints, self.pad_lengths):
+        # 计算当前样本的属性约束嵌入总长度
         attr_len = self.calc_attribute_length(attributes)
+        # 前缀长度 = 指令提示长度 + Padding长度（用于切分Token）
         prefix_len = instruct_len + pad_len
 
+        # ========== 切分并生成各部分嵌入 ==========
+        # a. Padding嵌入：Token中「指令提示后 - Padding」的部分 → 形状 [pad_len, emb_dim]
         pad_embed = self.original_emb(tokens[instruct_len:prefix_len])
+        # b. 原始输入嵌入：Token中「前缀+属性后」的部分 → 形状 [input_len, emb_dim]
         input_embed = self.original_emb(tokens[prefix_len+attr_len:])
+        # c. 属性约束嵌入：基于原始输入嵌入生成属性约束嵌入 → 形状 [attr_len, emb_dim]
         attr_embed = self.embed_constraints(input_embed, attributes)
         final_embed = torch.cat([instruct_embed, pad_embed, attr_embed, input_embed])
         final_embeddings.append(final_embed)
-
+      # 批次维度：torch.stack(final_embeddings) → 形状 [batch_size, final_seq_length, dim]
       return torch.stack(final_embeddings).to(device)
-
+    # ========== 生成阶段：禁用软提示，直接返回原始嵌入 ==========
     else: # do not use soft prompt if we are in the generation phase
+      # 生成阶段（如GPT自回归生成）：仅用原始Token嵌入，不拼接软提示/属性
       return self.original_emb(token_batch)
 
   @staticmethod
