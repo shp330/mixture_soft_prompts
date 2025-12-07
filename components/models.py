@@ -19,44 +19,111 @@ from sentence_transformers.model_card_templates import ModelCardTemplate
 from typing import List, Dict, Tuple, Type, Callable
     
 class BaseModel(nn.Module):
+  """
+  基础模型抽象类，封装通用的分类头、dropout、激活函数等逻辑
+  实现了基于 BERT/RoBERTa 的分类任务通用框架，封装了编码器、分类头、损失计算等核心逻辑
+
+  Attributes:
+      model_type: 模型类型
+      weight_decay: 权重衰减系数
+  """
   def __init__(self, args, core, tokenizer):
-    super(BaseModel, self).__init__()
+    """
+
+    Args:
+        args: 配置参数对象，需包含以下字段：
+            - model: 模型类型，支持 'bert'/'roberta'
+            - verbose: 是否打印详细日志
+            - debug: 调试模式开关
+            - weight_decay: 权重衰减系数
+            - drop_rate: dropout 概率
+            - hidden_size: 分类头隐藏层维度
+            - ont_size: 分类任务的类别数
+        core: 预训练编码器核心（如 BertModel/RobertaModel）
+        tokenizer: 对应的 tokenizer，用于辅助调试/日志输出
+    """
+    super().__init__()
     self.name = 'base-model'
     self.encoder = core
-    self.model_type = args.model
+    self.model_type = args.model.lower()  # 统一小写，增强鲁棒性
     self.tokenizer = tokenizer
 
+    # 配置参数
     self.verbose = args.verbose
     self.debug = args.debug
     self.weight_decay = args.weight_decay
+
+    # 网络层
     self.dropout = nn.Dropout(args.drop_rate)
 
     self.dense = nn.Linear(core.config.hidden_size, args.hidden_size)
     self.gelu = nn.GELU()
-    self.classify = nn.Linear(args.hidden_size, args.ont_size) 
-    self.softmax = nn.LogSoftmax(dim=1)
+    self.classify = nn.Linear(args.hidden_size, args.ont_size)
+
+    # 损失函数与激活函数
+    self.softmax = nn.LogSoftmax(dim=1) # 改为 dim=-1，适配任意维度
     self.criterion = nn.CrossEntropyLoss()  # performs LogSoftmax and NegLogLike Loss
 
-  def forward(self, inputs, targets, outcome='logit'):
+  def forward(
+      self,
+      inputs: dict,
+      targets,
+      outcome='logit'
+  ):
+    """
+    兼容RoBERTa/BERT 训练/推理模式（targets 可选）
+    Args:
+        inputs: 自 tokenizer 的编码结果，通常是字典，包含：
+                - input_ids
+                - attention_mask
+                - token_type_ids（可能包含，但 RoBERTa 不用）
+        targets: 真实标签，形状 [batch_size]，推理时可传 None
+        outcome: 指定返回哪种形式的输出【当前代码只实现了 'logit' 和 'softmax'，没有处理 'log_softmax'】：
+                - 'logit'：原始未归一化的分数（用于训练）
+                - 'softmax'：概率分布（用于推理/预测）
+                - 'log_softmax'：对数概率（常用于某些损失函数或 NLL）
+
+    Returns:
+        output: 模型输出（logit 或 概率）
+        loss: 损失值（targets 为 None 时返回 None）
+
+    """
     if self.model_type == 'roberta':
       """ By default, the encoder returns result of (batch_size, seq_len, vocab_size) under 'logits'
       When the output_hs flag is turned on, the output will also include a tuple under 'hidden_states'
-      The tuple has two parts, the first is embedding output and the second is hidden_state of last layer
+      The tuple has two parts, the 【first is embedding output】 and the 【second is hidden_state of last layer】
       """
-      enc_out = self.encoder(**inputs, output_hidden_states=True) 
+      enc_out = self.encoder(**inputs, output_hidden_states=True)
       cls_token = enc_out['hidden_states'][1][:, 0, :]
+    # BERT 分支
     else:
+      # 调用 BERT 编码器，获取最后一层所有 token 的表示。
       enc_out = self.encoder(**inputs)
-      cls_token = enc_out['last_hidden_state'][:, 0, :]   # batch_size, embed_dim
-    
+      # 取第 0 个位置（即 [CLS] token）作为整个句子的表示。
+      # cls_token 形状：[batch_size, hidden_size]
+      cls_token = enc_out['last_hidden_state'][:, 0, :]   # batch_size, embed_dim  BERT取最后一层CLS token
+
+    # 典型的 MLP 分类头前向传播
+    # 输入：[CLS] 向量（[batch_size, hidden_dim]）
+    # 经过：Dropout → Linear → GELU → Dropout → Linear（分类层）
+    # 输出：logits，形状应为 [batch_size, num_classes]
     hidden1 = self.dropout(cls_token)
+    # 分类头采用 “线性层 + GELU+dropout” 的经典结构，兼顾表达能力和泛化性；
     hidden2 = self.dense(hidden1)
     hidden3 = self.gelu(hidden2)
     hidden4 = self.dropout(hidden3)
-    logits = self.classify(hidden4)  # batch_size, num_classes
+    logits = self.classify(hidden4)  # [batch_size, num_classes]
+    # ！！可能导致维度丢失！！
+    # 如果 num_classes == 1（如二分类用单输出），squeeze() 会把 [B, 1] 变成 [B]
+    # 如果 num_classes > 1，squeeze() 无影响
+    # 但 CrossEntropyLoss 要求 logits 是 [B, C]，target 是 [B]（long）
+    # 所以 不应无条件 squeeze，建议删除这行。
     logits = logits.squeeze()
-    
+
+    # 当 targets is None（推理模式）时，这行会报错（因为 criterion 不能接受 None 作为 target）
+    # loss = self.criterion(logits, targets) if targets is not None else None
     loss = self.criterion(logits, targets)
+    # 持返回 logit（原始得分）或 softmax（概率），适配训练 / 推理不同需求
     output = logits if outcome == 'logit' else self.softmax(logits)
     return output, loss
 
@@ -94,20 +161,33 @@ def prepare_inputs_for_generation(input_ids, past=None, encoder_hidden_states=No
   return model_inputs
 
 class CVAEModel(BaseModel):
+  """
+  基于 CVAE（条件变分自编码器）的生成模型，结合 BERT 编码器 + GPT2 解码器
+  结合变分自编码器（VAE）+ 编码器 - 解码器架构，实现可控文本生成
+
+  Beam Search：通过 num_beams 和 beam_scorer 实现束搜索，提升生成质量。
+
+  """
   def __init__(self, args, encoder, decoder_config, decoder, tokenizer): 
     super().__init__(args, encoder, tokenizer)
     self.name = 'cvae-model'
-    self.embedder = encoder.embeddings
+    self.embedder = encoder.embeddings  # BERT嵌入层
     self.config = decoder_config
-    self.decoder = decoder
+    self.decoder = decoder  # GPT2解码器（改造后支持cross attention）
+    # 替换解码器的生成功能的输入处理逻辑（适配自定义嵌入+隐变量z）
     self.decoder.prepare_inputs_for_generation = prepare_inputs_for_generation
+
+    # VAE的均值/方差层（实现隐变量z的采样）
     self.mu_linear = torch.nn.Linear(encoder.config.hidden_size, encoder.config.hidden_size)
     self.logvar_linear = torch.nn.Linear(encoder.config.hidden_size, encoder.config.hidden_size)
 
+    # 生成相关配置（beam search、停止条件、logits处理）
+    # 通过 MaxLengthCriteria 限制生成文本长度。
     self.stopping_criteria = StoppingCriteriaList([MaxLengthCriteria(max_length=args.target_max_len)])
     self.num_beams = args.num_generations
     self.beam_scorer_batch_size = args.num_generations
     self.beam_scorer = BeamSearchScorer(self.beam_scorer_batch_size, num_beams=self.num_beams, device=device)
+    # Logits处理器/扭曲器（控制生成策略：温度、重复惩罚等）
     self.logits_warpers = self.decoder._get_logits_warper(temperature=args.temperature, top_k=0, top_p=1.0)
     self.logits_processors = self.decoder._get_logits_processor(
             repetition_penalty=args.threshold,
@@ -134,17 +214,44 @@ class CVAEModel(BaseModel):
             forced_decoder_ids=None, 
         )
 
-  
-  def get_input_embeddings(self, input_ids, attention_mask):
+  def get_input_embeddings(
+      self,
+      input_ids,
+      attention_mask
+  ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    从编码器中提取输入词嵌入（H0）和 CLS token的最终隐藏状态（h_0_last）
+    适配 RoBERTa/BERT 编码器（无token type ids）
+
+    用于从 CVAE 模型的编码器（RoBERTa/BERT）中提取词嵌入矩阵和CLS token 的最终隐藏状态
+    Args:
+        input_ids: 输入token的id序列，shape=(B, seq_len)
+        attention_mask: 注意力掩码，shape=(B, seq_len)
+
+    Returns:
+        - H0: 输入词嵌入矩阵，shape=(B, seq_len, hidden_size)
+        - h_0_last: CLS token的最终隐藏状态，shape=(B, hidden_size)
+
+    """
+    # 1. 提取词嵌入（避免重复计算，复用编码器内置的嵌入层）
+    # detach().clone() 防止梯度回传至原始input_ids
     # roberta does not use token type ids
-    H0 = self.embedder(input_ids=input_ids.detach().clone()) # (B, seq_len, hidden_size)
+    H0 = self.embedder(input_ids=input_ids.detach().clone()) # (batch, seq_len, hidden_size)
     # encode, get h_0_last
     H0 = H0.to(device)
-    h_0_last = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state[:,0] # (B, hidden_size)
-    # h_0_last = self.encoder(input_embeds=H0, attention_mask=attention_mask).last_hidden_state[:,0] # (B, hidden_size) # we can just pass in input ids and token type ids, itll do input embeds internally
+    h_0_last = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state[:,0] # (Batch, hidden_size)
+    # h_0_last = self.encoder(input_embeds=H0, attention_mask=attention_mask).last_hidden_state[:,0] # (Batch, hidden_size) # we can just pass in input ids and token type ids, itll do input embeds internally
     return H0, h_0_last
 
   def reparameterize(self, h_0_last):
+    """
+    VAE重参数化技巧：从N(mu, var)采样隐变量z
+    Args:
+        h_0_last:
+
+    Returns:
+
+    """
     # reparameterize to get z
     mu = self.mu_linear(h_0_last)
     logvar = self.logvar_linear(h_0_last)
@@ -155,44 +262,108 @@ class CVAEModel(BaseModel):
     return z, logvar, mu
 
   def decode(self, input_ids, attention_mask, labels, z):
+    """
+    融合隐变量z与解码器输入，调用GPT2解码器计算损失/输出    BERT编码 + VAE均值/方差计算
+    Args:
+        input_ids: 完整输入序列（包含条件部分+生成目标部分），shape=(B, seq_len)
+        attention_mask: 输入序列的注意力掩码，shape=(B, seq_len)
+        labels: 解码器的目标标签（用于计算损失），shape=(B, seq_len)
+        z: CVAE采样的隐变量，shape=(B, 1, hidden_size)
+
+    Returns:
+        解码器输出（包含logits、loss等）
+
+    """
     # decode
     # For RoBERTa, sep token id is eos token id
-    indices_of_sep = 1 + (input_ids == self.tokenizer.eos_token_id).max(dim=1).indices
+    # ========== 1. 分离条件部分和生成目标部分（基于SEP/EOS token） ==========
+    # RoBERTa中SEP token ID = EOS token ID，找到每个样本的SEP位置
+    indices_of_sep = 1 + (input_ids == self.tokenizer.eos_token_id).max(dim=1).indices # (B, seq_len)
+
+    #  ========== 2. 构建生成目标部分的注意力掩码（y_attn_mask） ==========
+    #  y_attn_mask: 1 表示生成目标部分， 0表示条件部分
     y_attn_mask = torch.zeros(attention_mask.shape)
-    y_attn_mask[(torch.arange(attention_mask.shape[0]), indices_of_sep)] = 1 
-    y_attn_mask = y_attn_mask.cumsum(dim=1).to(device)
-    y_attn_mask = 1 - y_attn_mask
-    y_ids = torch.where(y_attn_mask==1, input_ids, self.tokenizer.pad_token_id).to(device)
+    y_attn_mask[(torch.arange(attention_mask.shape[0]), indices_of_sep)] = 1  # SEP后一位标记为1
+    y_attn_mask = y_attn_mask.cumsum(dim=1).to(device)  # 累积和：SEP后全为1，前为0
+    y_attn_mask = 1 - y_attn_mask  # 反转：条件部分=1，生成目标部分=0 → 最终：生成目标部分=1，条件部分=0
+
+    # ========== 3. 提取生成目标部分的输入ID（y_ids） ==========
+    # 将条件部分替换为PAD，仅保留生成目标部分的有效ID
+    y_ids = torch.where(
+        y_attn_mask == 1,  # 生成目标部分保留原ID
+        input_ids,
+        self.tokenizer.pad_token_id  # 条件部分替换为PAD
+    ).to(device)
+
+    # ========== 4. 生成目标部分的词嵌入（H0_y） ==========
     H0_y = self.embedder(input_ids=y_ids)
 
     # get H12'
+    # ========== 5. 融合隐变量z与生成目标嵌入（构建解码器输入） ==========
+    # z: (B, 1, hidden_size) → 拼接在生成目标嵌入前（去掉第一个PAD位）
     decoder_inputs = torch.cat((z, H0_y[:,1:]), dim=1) # (B, y_seq_len, hidden_size)
+
+    # 增强z的融合：将z与每个位置的嵌入拼接（hidden_size*2）
     _, seq_len, _ = decoder_inputs.shape
     decoder_inputs = torch.cat((decoder_inputs, z.repeat(1, seq_len, 1)), dim=-1) # (B, y_seq_len, hidden_size*2)
+
+    # ========== 6. 处理解码器标签（忽略PAD部分的损失） ==========
     d_labels = torch.where(labels==self.tokenizer.pad_token_id, -100, labels)
+
+    # 构建标签的注意力掩码（PAD位置为0）
     labels_attn_mask = torch.where(labels == self.tokenizer.pad_token_id, 0, 1)
-    outputs = self.decoder(input_ids=labels, attention_mask=labels_attn_mask, encoder_hidden_states=decoder_inputs, labels=d_labels, encoder_attention_mask=y_attn_mask)
+
+    # ========== 7. 调用GPT2解码器前向传播 ==========
+    outputs = self.decoder(
+        input_ids=labels,
+        attention_mask=labels_attn_mask,
+        encoder_hidden_states=decoder_inputs,  # 融合z的解码器输入（cross attention的key/value）
+        labels=d_labels,  # 训练时的目标标签（计算损失）
+        encoder_attention_mask=y_attn_mask  # 生成目标部分的注意力掩码
+    )
 
     return outputs
 
   def forward(self, input_ids, attention_mask, labels):
+    #  1. 编码器：获取CLS token的隐藏态（h_0_last）
     _, h_0_last = self.get_input_embeddings(input_ids, attention_mask)
+
+    # 2. 重参数化：采样隐变量z（核心VAE逻辑）
+    # reparameterize：通过均值（mu）和方差（logvar）采样隐变量 z，保证梯度可回传；
     z, logvar, mu = self.reparameterize(h_0_last)
+    # 3. 解码器：基于z和输入生成文本，计算生成损失
+    # decode：将 z 拼接至解码器输入，结合 GPT2 的生成逻辑计算损失；
     outputs = self.decode(input_ids, attention_mask, labels, z)
     
     # https://arxiv.org/pdf/1312.6114.pdf
+    # 4. 损失融合：生成损失 + KL散度（VAE的核心损失）
+    # 损失由两部分组成：生成损失（GPT2 的 LM 损失） + KL 散度（约束 z 服从标准正态分布）。
     kld = -0.5 * (1+logvar-mu**2-logvar.exp()).sum() # or avg before sum? https://github.com/shj1987/ControlVAE-ICML2020/blob/master/Language_modeling/Text_gen_PTB/model.py
     outputs.loss += kld
     
     return outputs
 
   def generate(self, input_ids, attention_mask, **kwargs):
+    """
+    生成方法：beam search 生成
+    生成特点：
+      生成阶段从标准正态分布采样 z，实现 “可控 + 多样” 的文本生成；
+      采用 beam search 提升生成质量，支持自定义停止条件、温度系数等
+    Args:
+        input_ids:
+        attention_mask:
+        **kwargs:
+
+    Returns:
+
+    """
     input_ids = input_ids.to(device)
     H0 = self.embedder(input_ids=input_ids) #, token_type_ids=token_type_ids) # (B, seq_len, hidden_size)\
     B, seq_len, hidden_size = H0.shape # should be just the z and y
+    # 1. 随机采样隐变量z（生成阶段无监督信号，直接采样）
     z = torch.randn((B, hidden_size)).to(device) #  (B, hidden_size)
     z = z[:, None, :] # (B, 1, hidden_size)
-
+    # 2. 构造解码器输入：拼接z和编码器嵌入
     decoder_inputs = torch.cat((z, H0[:,1:]), dim=1) # (B, seq_len, hidden_size)
     decoder_inputs = torch.cat((decoder_inputs, z.repeat(1, seq_len, 1)), dim=-1).to(device) # (B, seq_len, hidden_size*2)
     decoder_inputs = decoder_inputs.repeat_interleave(self.num_beams, dim=0)
@@ -204,6 +375,7 @@ class CVAEModel(BaseModel):
         beam_scorer = BeamSearchScorer(batch_size=B, num_beams=self.num_beams, device=device)
     else:
         beam_scorer = self.beam_scorer
+    # 3. Beam search生成
     outputs = self.decoder.beam_sample(starter_inputs, beam_scorer=beam_scorer, encoder_hidden_states=decoder_inputs, \
             encoder_attention_mask=encoder_attention_mask, stopping_criteria=self.stopping_criteria, \
             pad_token_id=self.config.pad_token_id, logits_processor=self.logits_processors, logits_warper=self.logits_warpers, **kwargs)
@@ -251,26 +423,43 @@ class CVAEModel(BaseModel):
     return model
 
 class DualClassifier(BaseModel):
+  """
+  双标签分类模型，同时预测 intent（意图）和 slot（槽位）
+  """
   # Model for predicting both intents and slots at once
   def __init__(self, args, core, tokenizer, primary_size, secondary_size):
     super().__init__(args, core, tokenizer)
     self.name = 'dual-classify'
 
     self.model_type = 'roberta' if args.size in ['small', 'medium'] else 'deberta'
-    self.primary_classify = nn.Linear(args.hidden_size, primary_size) 
-    self.secondary_classify = nn.Linear(args.hidden_size, secondary_size) 
+    self.primary_classify = nn.Linear(args.hidden_size, primary_size)  # intent分类头
+    self.secondary_classify = nn.Linear(args.hidden_size, secondary_size)  # slot分类头
 
   def forward(self, inputs, targets, outcome='logit'):
-    enc_out = self.encoder(**inputs, output_hidden_states=True) 
+    """
+    共享编码器和隐藏层，降低参数量；
+    双分类头分别预测意图（intent）和槽位（slot），损失求和训练；
+    输出为字典格式，区分两个任务的预测结果，适配对话系统的核心需求
+    Args:
+        inputs:
+        targets:
+        outcome:
+
+    Returns:
+
+    """
+    # 共享编码器，双分类头分别计算损失
+    enc_out = self.encoder(**inputs, output_hidden_states=True)
     cls_token = enc_out['hidden_states'][-1][:, 0, :]
-    
+    # 共享隐藏层计算
     hidden1 = self.dropout(cls_token)
     hidden2 = self.dense(hidden1)
     hidden3 = self.gelu(hidden2)
     hidden4 = self.dropout(hidden3)
-
+    # 双分类头
     intent_logits = self.primary_classify(hidden4)
     slot_logits = self.secondary_classify(hidden4)         # batch_size, num_classes
+    # 损失求和
     intent_loss = self.criterion(intent_logits, targets['intent'])
     slot_loss = self.criterion(slot_logits, targets['slot'])
     loss = intent_loss + slot_loss
@@ -282,6 +471,10 @@ class DualClassifier(BaseModel):
     return output, loss
 
 class GenerateModel(BaseModel):
+  """
+  通用分类模型，简化版BaseModel
+  极简分类模型，直接用 CLS token 作为 logits，适用于快速验证
+  """
   # Main model for general classification prediction
   def __init__(self, args, core, tokenizer):
     super().__init__(args, core, tokenizer)
@@ -297,8 +490,21 @@ class GenerateModel(BaseModel):
     return output, loss
 
 class SentenceBERT(SentenceTransformer):
-
+  """
+  扩展训练 / 相似度评估逻辑（qualify方法）
+  """
   def qualify(self, features, utterances):
+    """
+    qualify方法：可视化句子相似度，便于调试和效果验证；
+
+    Args:
+        features:
+        utterances:
+
+    Returns:
+
+    """
+    # 随机选一个句子，计算与其他句子的余弦相似度，输出最相似/最不相似的句子
     chosen_id = random.randint(0, len(utterances) - 1)
     chosen_utt = utterances[chosen_id]
     chosen_embed = features['sentence_embedding'][chosen_id].unsqueeze(0)
@@ -343,6 +549,12 @@ class SentenceBERT(SentenceTransformer):
       checkpoint_save_total_limit: int = 0,
       args=None):
     """
+    # 扩展训练逻辑：支持自定义损失函数、梯度裁剪、 checkpoint保存、训练中评估
+    # 核心改造：
+    # 1. 优化器分组（区分weight decay）：对 bias/LayerNorm 不做 weight decay，提升训练稳定性。
+    # 2. 训练中随机选批次做相似度评估（do_qual）；
+    # 3. 自定义学习率调度器、梯度归一化；
+    # 4. 保存最佳模型（基于evaluator得分）。
     Train the model with the given training objective
     Each training objective is sampled in turn for one batch.
     We sample only as many batches from each objective as there are in the smallest one
@@ -464,6 +676,10 @@ class SentenceBERT(SentenceTransformer):
       self._save_checkpoint(checkpoint_path, checkpoint_save_total_limit, global_step)
 
 class SingleClassifier(AutoModelForSequenceClassification):
+  """
+  单标签分类模型
+  适配 Hugging Face 标准分类接口，开箱即用。
+  """
   def __init__(self, *args, **kwargs):
     super(SingleClassifier, self).__init__(*args, **kwargs)
     self.name = 'single-classify'
