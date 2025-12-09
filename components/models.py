@@ -162,33 +162,84 @@ def prepare_inputs_for_generation(input_ids, past=None, encoder_hidden_states=No
 
 class CVAEModel(BaseModel):
   """
-  基于 CVAE（条件变分自编码器）的生成模型，结合 BERT 编码器 + GPT2 解码器
-  结合变分自编码器（VAE）+ 编码器 - 解码器架构，实现可控文本生成
+  基于条件变分自编码器（CVAE）的可控文本生成模型，融合了 BERT 作为编码器、GPT-2 作为解码器，
+    并引入了 隐变量采样（VAE）机制 和 束搜索（Beam Search）生成策略
 
-  Beam Search：通过 num_beams 和 beam_scorer 实现束搜索，提升生成质量。
+    - Beam Search：通过 num_beams 和 beam_scorer 实现束搜索，提升生成质量。
+    - CVAE（条件变分自编码器）：在标准 VAE 基础上，加入“条件信息”（如输入文本），使得生成过程可以受控。
+  用途：可控文本生成（如风格迁移、对话生成、摘要等）
+  CVAE 模型的目标：
+    - 从输入文本中提取语义表示（通过 BERT/RoBERTa 编码器）
+    - 学习隐变量 z：用 VAE 的方式学习一个潜在变量 z，即，隐变量（代表句子的压缩语义）。
+        通过 VAE 从编码器输出采样，引入可控随机性。通过重参数化技巧从均值和方差中采样，引入随机性，提升多样性。
+    - z 可用于后续任务（如文本生成、风格迁移、对话生成等）
 
+  Notes:
+      架构：
+        - 编码器（BERT）：将输入文本编码为上下文感知的表示。
+        - 通过 mu_linear / logvar_linear 构建 VAE 的隐空间
+        - 解码器（GPT-2）：改造版 GPT-2，支持 cross-attention（看编码器）+ 接收 z。
+            基于隐变量 z 和可能的条件信息（如 BERT 编码结果），自回归地生成目标文本。
+        - 自定义 prepare_inputs_for_generation 实现隐变量 z 注入生成过程
+      生成控制（支持 Beam Search + 温度采样 + 重复惩罚）：
+        - 使用 StoppingCriteriaList + BeamSearchScorer 控制生成长度与搜索策略
+        - 利用 logits_warpers（temperature/top-p）和 logits_processors（重复惩罚等）提升文本质量
   """
-  def __init__(self, args, encoder, decoder_config, decoder, tokenizer): 
+  def __init__(self, args, encoder, decoder_config, decoder, tokenizer):
+    """
+
+    Args:
+        args: 包含超参数（如温度、beam 数、最大长度等）。
+        encoder: BERT 编码器。
+        decoder_config:
+        decoder: 改造后的 GPT-2，支持 cross-attention（即能关注编码器输出）。
+        tokenizer: 用于文本与 token ID 互转。
+    """
     super().__init__(args, encoder, tokenizer)
     self.name = 'cvae-model'
-    self.embedder = encoder.embeddings  # BERT嵌入层
+    self.embedder = encoder.embeddings  # BERT嵌入层，后续可能用于构造初始输入。
     self.config = decoder_config
+    # 被修改过的 GPT-2 ，支持 cross-attention，即能接收来自编码器（BERT）的 key/value，实现 encoder-decoder 架构（类似 BART/T5）。
     self.decoder = decoder  # GPT2解码器（改造后支持cross attention）
-    # 替换解码器的生成功能的输入处理逻辑（适配自定义嵌入+隐变量z）
+    # 关键定制点：覆盖 GPT-2 默认的 prepare_inputs_for_generation 方法。
+    #           替换解码器的生成功能的输入处理逻辑（适配自定义嵌入+隐变量z）
+    # 原因：标准 GPT-2 是纯 decoder，不处理隐变量 z 或 encoder hidden states。
+    # 自定义函数需在生成时注入：
+    #   隐变量 z（拼接到输入嵌入或作为额外条件）：通过 VAE 从编码器输出采样，引入可控随机性
+    #   encoder 的输出（用于 cross-attention）
+    #   past_key_values 等缓存机制
     self.decoder.prepare_inputs_for_generation = prepare_inputs_for_generation
 
-    # VAE的均值/方差层（实现隐变量z的采样）
+    # VAE隐变量建模：均值/方差层（实现隐变量z的采样）
+    # 从 BERT 编码器的 [CLS] 表示（或其他聚合表示）预测隐变量 z 的分布参数
+    #   - mu = self.mu_linear(h)
+    #   - logvar = self.logvar_linear(h)
+    # 然后通过【重参数化技巧（reparameterization trick）】 采样：
     self.mu_linear = torch.nn.Linear(encoder.config.hidden_size, encoder.config.hidden_size)
     self.logvar_linear = torch.nn.Linear(encoder.config.hidden_size, encoder.config.hidden_size)
 
     # 生成相关配置（beam search、停止条件、logits处理）
-    # 通过 MaxLengthCriteria 限制生成文本长度。
+    # 1、Stopping Criteria（停止条件）
+    #    通过 MaxLengthCriteria 限制生成文本长度，生成达到 target_max_len 时自动停止。
     self.stopping_criteria = StoppingCriteriaList([MaxLengthCriteria(max_length=args.target_max_len)])
+
+    # 2、Beam Search（束搜索）：使用 BeamSearchScorer 实现束搜索。
+    #   注意：beam_scorer_batch_size 应等于输入 batch size × num_beams（此处命名可能有误，
+    #          通常 batch_size 是原始输入 batch，不是 num_generations）。
+    #   实际使用时需确保输入张量已扩展为 batch_size * num_beams。
     self.num_beams = args.num_generations
     self.beam_scorer_batch_size = args.num_generations
     self.beam_scorer = BeamSearchScorer(self.beam_scorer_batch_size, num_beams=self.num_beams, device=device)
-    # Logits处理器/扭曲器（控制生成策略：温度、重复惩罚等）
+
+    # 3. Logits Warpers（采样策略）扭曲器（控制生成策略：温度等）
+    #    控制生成的随机性：
+    #      - temperature：调节 softmax 的平滑度（<1 更确定，>1 更随机）
+    #      - 此处 top_k=0, top_p=1.0 表示不使用 top-k/top-p 采样，仅用温度缩放。
     self.logits_warpers = self.decoder._get_logits_warper(temperature=args.temperature, top_k=0, top_p=1.0)
+
+    # 4. Logits Processors 后处理约束（控制生成策略：重复惩罚）
+    #    - 重复惩罚：repetition_penalty（值 >1 抑制重复 token）
+    #    - n-gram 重复禁止：no_repeat_ngram_size（如设为 2，则禁止连续 2-gram 重复）
     self.logits_processors = self.decoder._get_logits_processor(
             repetition_penalty=args.threshold,
             no_repeat_ngram_size=decoder.config.no_repeat_ngram_size,
@@ -220,10 +271,12 @@ class CVAEModel(BaseModel):
       attention_mask
   ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    从编码器中提取输入词嵌入（H0）和 CLS token的最终隐藏状态（h_0_last）
+    从 BERT/RoBERTa 编码器中提取（⚠️注意：RoBERTa/BERT 的 [CLS] token 位于序列开头（index 0），通常用于句子级表示）：
+      - 词嵌入矩阵 H0（即输入 token 的初始嵌入，未经 Transformer 编码）
+      - [CLS] token 的最终隐藏状态 h_0_last（经过整个编码器后的表示）
+
     适配 RoBERTa/BERT 编码器（无token type ids）
 
-    用于从 CVAE 模型的编码器（RoBERTa/BERT）中提取词嵌入矩阵和CLS token 的最终隐藏状态
     Args:
         input_ids: 输入token的id序列，shape=(B, seq_len)
         attention_mask: 注意力掩码，shape=(B, seq_len)
@@ -234,31 +287,44 @@ class CVAEModel(BaseModel):
 
     """
     # 1. 提取词嵌入（避免重复计算，复用编码器内置的嵌入层）
-    # detach().clone() 防止梯度回传至原始input_ids
+    # detach().clone() 防止梯度回传至原始input_ids，
+    #   input_ids 是 LongTensor，本身不可导，.detach().clone() 可能略显冗余，但无害。
     # roberta does not use token type ids
+    # H0: 初始词嵌入（未经过 Transformer），用于后续可能的重建或解码
     H0 = self.embedder(input_ids=input_ids.detach().clone()) # (batch, seq_len, hidden_size)
     # encode, get h_0_last
     H0 = H0.to(device)
+    # last_hidden_state：最后一层所有 token 的表示，形状 (B, seq_len, hidden_size)
+    # [:, 0]：取第 0 个 token（即 [CLS]）作为句子表示，输出形状：(B, hidden_size)
     h_0_last = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state[:,0] # (Batch, hidden_size)
     # h_0_last = self.encoder(input_embeds=H0, attention_mask=attention_mask).last_hidden_state[:,0] # (Batch, hidden_size) # we can just pass in input ids and token type ids, itll do input embeds internally
     return H0, h_0_last
 
   def reparameterize(self, h_0_last):
     """
-    VAE重参数化技巧：从N(mu, var)采样隐变量z
+    VAE重参数化技巧：从采样隐变量z
+    实现 VAE 的重参数化技巧，从后验分布 q(z∣x)=N(μ,σ^2)【即，N(mu, var)】 中采样隐变量 z。
     Args:
-        h_0_last:
+        h_0_last: 句子表示，即，最后一层隐藏层的第一个 token 表示，即 [cls]
 
     Returns:
+        - z: 采样得到的隐变量，形状 (B, 1, hidden_size)
+        - logvar, mu: 对数方差和均值，用于计算 KL 散度损失（VAE 损失的一部分）
 
     """
     # reparameterize to get z
+    # z = mu + exp(0.5 * logvar) * ε,   ε ~ N(0, I)
+    # z 的维度与 BERT 隐藏层相同（例如 768），可直接用于初始化解码器状态或拼接输入。
+    # 计算均值 mu 和 对数方差 logvar；mu, logvar 形状均为 (B, hidden_size)
     mu = self.mu_linear(h_0_last)
     logvar = self.logvar_linear(h_0_last)
-    std = (0.5*logvar).exp()
+    std = (0.5 * logvar).exp()
+    # 从标准正态分布采样噪声 eps
     eps = torch.randn_like(mu)
-    z = mu + eps*std # (B, hidden_size)
-    z = z[:, None, :] # (B, 1, hidden_size)
+    z = mu + eps * std  # (B, hidden_size)
+    # 添加一个序列维度（长度为 1），便于与词嵌入拼接或作为解码器初始状态
+    #   常见于：将 z 作为额外 token 输入解码器，或初始化 RNN/LSTM 隐藏状态
+    z = z[:, None, :]  # (B, 1, hidden_size)
     return z, logvar, mu
 
   def decode(self, input_ids, attention_mask, labels, z):
@@ -334,13 +400,15 @@ class CVAEModel(BaseModel):
     # 3. 解码器：基于z和输入生成文本，计算生成损失
     # decode：将 z 拼接至解码器输入，结合 GPT2 的生成逻辑计算损失；
     outputs = self.decode(input_ids, attention_mask, labels, z)
-    
+
     # https://arxiv.org/pdf/1312.6114.pdf
     # 4. 损失融合：生成损失 + KL散度（VAE的核心损失）
     # 损失由两部分组成：生成损失（GPT2 的 LM 损失） + KL 散度（约束 z 服从标准正态分布）。
-    kld = -0.5 * (1+logvar-mu**2-logvar.exp()).sum() # or avg before sum? https://github.com/shj1987/ControlVAE-ICML2020/blob/master/Language_modeling/Text_gen_PTB/model.py
+    kld = -0.5 * (
+        1 + logvar - mu ** 2 - logvar.exp()
+    ).sum()  # or avg before sum? https://github.com/shj1987/ControlVAE-ICML2020/blob/master/Language_modeling/Text_gen_PTB/model.py
     outputs.loss += kld
-    
+
     return outputs
 
   def generate(self, input_ids, attention_mask, **kwargs):
