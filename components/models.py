@@ -128,17 +128,58 @@ class BaseModel(nn.Module):
     return output, loss
 
 
-def prepare_inputs_for_generation(input_ids, past=None, encoder_hidden_states=None, **kwargs):
+def prepare_inputs_for_generation(
+    input_ids,
+    past=None,
+    encoder_hidden_states=None,
+    **kwargs
+):
+  """
+  实现隐变量 z 注入生成过程
+  Args:
+      input_ids: 当前要输入模型的 token ID 序列（形状通常是 [batch_size, seq_len]）。
+      past: 之前生成步骤中缓存的 key/value states（用于加速推理，避免重复计算），如果存在说明是增量解码（incremental decoding）。
+      encoder_hidden_states: 用于 seq2seq 模型。在编码器-解码器架构（如 BART、T5）中，编码器输出的隐藏状态，供解码器 cross-attention 使用。
+      **kwargs: 其他可选参数，如 attention_mask、token_type_ids、position_ids、use_cache 等。
+
+  Notes:
+       用于在自回归文本生成（如使用 Transformer 解码器或编码器-解码器架构）过程中，为模型的每一步生成准备好输入数据。
+         它特别适用于 Hugging Face Transformers 库中某些模型（比如 GPT、BART、T5 等）
+         在调用 .generate() 方法时的内部逻辑。
+       支持不同架构：
+         - 自编码器（如BERT）不需要此优化
+         - 自回归模型（如GPT）需要此优化
+         - 编码器-解码器（如T5/BART）需要encoder_hidden_states
+       position_ids：位置 id 在 Transformer 模型中用于表示每个 token 在序列中的位置信息。
+         Transformer 没有“顺序”概念，其自注意力机制是置换不变的（permutation-invariant），
+         为了解决这个问题，原始 Transformer 论文引入了 位置编码（Positional Encoding），告诉模型每个 token 的位置。
+         在 Hugging Face 的大多数模型（如 GPT-2、BERT、RoBERTa、BART 等）中，
+           position_ids 就是用来索引位置嵌入（position embeddings）的整数张量，形状与 input_ids 相同。
+      两种位置编码实习方式：
+        - 绝对位置编码（如 BERT、GPT）：使用 position_ids 作为索引，从一个可学习或固定的 embedding 表中查出对应位置向量，加到 token embedding 上。
+        - 相对位置编码（如 T5、DeBERTa）：不直接使用 position_ids，而是在注意力计算中显式建模 token 之间的相对距离。
+
+  Returns:
+
+  """
   token_type_ids = kwargs.get("token_type_ids", None)
+  # 1. 处理past存在时的输入裁剪
+  # 作用：当有过去的key-value缓存时，只需输入最后一个token
+  # 原因：之前所有token的计算结果已缓存在past中，无需重复计算
   # only last token for inputs_ids if past is defined in kwargs
+  # 如果 past 存在（即不是第一步生成），说明只需要最后一个 token 作为当前输入（因为前面的 token 已经通过 past 缓存了）。
+  # ✅这是高效生成的关键：避免重复输入整个历史序列。
   if past:
     input_ids = input_ids[:, -1].unsqueeze(-1)
+    # 同样地，如果提供了 token_type_ids，也只保留最后一个位置的值。
     if token_type_ids is not None:
       token_type_ids = token_type_ids[:, -1].unsqueeze(-1)
 
   attention_mask = kwargs.get("attention_mask", None)
   position_ids = kwargs.get("position_ids", None)
   
+  # 2. 动态创建位置ID
+  # 如果用户没有提供 position_ids，但提供了 attention_mask，就根据 attention mask 自动生成 position IDs。
   if attention_mask is not None and position_ids is None:
       # create position_ids on the fly for batch generation
     position_ids = attention_mask.long().cumsum(-1) - 1
@@ -152,11 +193,11 @@ def prepare_inputs_for_generation(input_ids, past=None, encoder_hidden_states=No
   if encoder_hidden_states is not None:
     model_inputs["encoder_hidden_states"] = encoder_hidden_states
   model_inputs.update({
-    "past_key_values": past,
-    "use_cache": kwargs.get("use_cache"),
-    "position_ids": position_ids,
-    "attention_mask": attention_mask,
-    "token_type_ids": token_type_ids,
+    "past_key_values": past, # 用于 KV 缓存加速
+    "use_cache": kwargs.get("use_cache"), # 是否启用缓存（通常生成时为 True）
+    "position_ids": position_ids, # 位置编码索引
+    "attention_mask": attention_mask, # 注意力掩码（用于区分真实 token 和 padding）
+    "token_type_ids": token_type_ids, # 用于区分句子 A/B（如 BERT 风格）
   })
   return model_inputs
 
@@ -329,12 +370,26 @@ class CVAEModel(BaseModel):
 
   def decode(self, input_ids, attention_mask, labels, z):
     """
+    作用：从编码的潜在表示 z 和输入文本中提取信息，生成目标文本（labels）的表示，通过解码器生成最终输出。
+    该函数是CVAE（条件变分自编码器）+ GPT2 解码器 架构中的核心解码逻辑，核心目标是：
+      - 从完整输入序列中分离「条件部分」和「生成目标部分」；
+      - 将 CVAE 采样的隐变量 z 融合到条件的词嵌入中；
+      - 调用 GPT2 解码器完成生成任务（训练时计算损失，推理时生成文本）；
+
+    将隐变量 z 与生成目标部分（response 或 reply）的词嵌入融合后，
+      作为 GPT-2 解码器的 cross-attention 输入，从而引导生成过程。
+    输入格式为：[条件文本] [SEP/EOS] [目标文本]，例如对话中的 [历史] [SEP] [回复]。
+    隐变量 z 是从 CVAE 的编码器（如 BERT + VAE 头）采样得到的，
+      shape 为 (B, 1, hidden_size)，代表整个条件-目标对的潜在语义。
+
     融合隐变量z与解码器输入，调用GPT2解码器计算损失/输出    BERT编码 + VAE均值/方差计算
+
     Args:
-        input_ids: 完整输入序列（包含条件部分+生成目标部分），shape=(B, seq_len)
-        attention_mask: 输入序列的注意力掩码，shape=(B, seq_len)
+        input_ids:输入文本的 token IDs，shape=(B, seq_len)
+          输入序列结构：[条件部分] + [SEP/EOS token] + [生成目标部分]（RoBERTa 中 SEP 和 EOS token ID 相同）
+        attention_mask: 输入文本的注意力掩码，shape=(B, seq_len)
         labels: 解码器的目标标签（用于计算损失），shape=(B, seq_len)
-        z: CVAE采样的隐变量，shape=(B, 1, hidden_size)
+        z: CVAE采样的隐变量（潜在变量）/编码表示，shape=(B, 1, hidden_size)
 
     Returns:
         解码器输出（包含logits、loss等）
@@ -343,49 +398,62 @@ class CVAEModel(BaseModel):
     # decode
     # For RoBERTa, sep token id is eos token id
     # ========== 1. 分离条件部分和生成目标部分（基于SEP/EOS token） ==========
-    # RoBERTa中SEP token ID = EOS token ID，找到每个样本的SEP位置
+    # 找到输入中分隔符（如 [SEP]或 <eos>）的位置，作为「条件部分」和「生成目标部分」的分割点；
+    #   （RoBERTa中 SEP token ID = EOS token ID，找到每个样本的第一个 SEP/EOS 位置）
+    # +1 是为了获取分隔符后的第一个 token 位置
+    # 结果：(B,) 形状的张量，表示每个批次中分隔符后的索引
     indices_of_sep = 1 + (input_ids == self.tokenizer.eos_token_id).max(dim=1).indices # (B, seq_len)
 
-    #  ========== 2. 构建生成目标部分的注意力掩码（y_attn_mask） ==========
-    #  y_attn_mask: 1 表示生成目标部分， 0表示条件部分
+    #  ========== 2. 构建条件部分的注意力掩码（y_attn_mask） ==========
+    # 创建全零掩码
     y_attn_mask = torch.zeros(attention_mask.shape)
+    # 在每个样本的分隔符后的位置标记为 1
     y_attn_mask[(torch.arange(attention_mask.shape[0]), indices_of_sep)] = 1  # SEP后一位标记为1
-    y_attn_mask = y_attn_mask.cumsum(dim=1).to(device)  # 累积和：SEP后全为1，前为0
-    y_attn_mask = 1 - y_attn_mask  # 反转：条件部分=1，生成目标部分=0 → 最终：生成目标部分=1，条件部分=0
+    # 累积和：SEP 及之前位置全为0，SEP之后位置全为1
+    y_attn_mask = y_attn_mask.cumsum(dim=1).to(device)
+    # 反转：分隔符后的部分为 0，前面为 1
+    y_attn_mask = 1 - y_attn_mask
 
-    # ========== 3. 提取生成目标部分的输入ID（y_ids） ==========
-    # 将条件部分替换为PAD，仅保留生成目标部分的有效ID
+    # ========== 3. 提取条件信息 ==========
+    # 只保留分隔符之前的 token（条件信息），分隔符之后的部分用 pad_token 填充
+    # 结果：y_ids 只包含条件部分
     y_ids = torch.where(
-        y_attn_mask == 1,  # 生成目标部分保留原ID
+        y_attn_mask == 1,
         input_ids,
-        self.tokenizer.pad_token_id  # 条件部分替换为PAD
+        self.tokenizer.pad_token_id
     ).to(device)
 
-    # ========== 4. 生成目标部分的词嵌入（H0_y） ==========
+    # ========== 4. 嵌入条件信息 ==========
+    # 将条件 token IDs 转换为嵌入向量，形状：(B, cond_seq_len, hidden_size)
     H0_y = self.embedder(input_ids=y_ids)
 
     # get H12'
-    # ========== 5. 融合隐变量z与生成目标嵌入（构建解码器输入） ==========
-    # z: (B, 1, hidden_size) → 拼接在生成目标嵌入前（去掉第一个PAD位）
+    # 将潜在变量 z与条件嵌入连接：H0_y[:,1:]可能跳过了第一个 token（如 [CLS]）
     decoder_inputs = torch.cat((z, H0_y[:,1:]), dim=1) # (B, y_seq_len, hidden_size)
 
-    # 增强z的融合：将z与每个位置的嵌入拼接（hidden_size*2）
+    # 增强z的融合：将 z在序列维度重复，并与原输入拼接。目的：让每个时间步都能访问完整的潜在表示 z
+    #   - 原始：(B, seq_len, hidden_size)
+    #   - 重复 z：(B, seq_len, hidden_size)
+    #   - 拼接后：(B, seq_len, hidden_size * 2)
     _, seq_len, _ = decoder_inputs.shape
+    # 这是一种更强的融合方式：每个位置的表示都显式包含全局隐变量 z。
     decoder_inputs = torch.cat((decoder_inputs, z.repeat(1, seq_len, 1)), dim=-1) # (B, y_seq_len, hidden_size*2)
 
     # ========== 6. 处理解码器标签（忽略PAD部分的损失） ==========
+    # -100 是 HuggingFace 的约定，表示忽略该位置的 loss。
     d_labels = torch.where(labels==self.tokenizer.pad_token_id, -100, labels)
 
     # 构建标签的注意力掩码（PAD位置为0）
+    # labels_attn_mask 用于 decoder 的 self-attention（防止看到 future tokens？但 GPT-2 自带 causal mask）。
     labels_attn_mask = torch.where(labels == self.tokenizer.pad_token_id, 0, 1)
 
     # ========== 7. 调用GPT2解码器前向传播 ==========
     outputs = self.decoder(
-        input_ids=labels,
-        attention_mask=labels_attn_mask,
-        encoder_hidden_states=decoder_inputs,  # 融合z的解码器输入（cross attention的key/value）
-        labels=d_labels,  # 训练时的目标标签（计算损失）
-        encoder_attention_mask=y_attn_mask  # 生成目标部分的注意力掩码
+        input_ids=labels,  # 目标序列
+        attention_mask=labels_attn_mask,  # 标签的注意力掩码
+        encoder_hidden_states=decoder_inputs,  # 条件信息 + 潜在变量
+        labels=d_labels, # 计算损失用的标签
+        encoder_attention_mask=y_attn_mask  # 只关注条件部分
     )
 
     return outputs
