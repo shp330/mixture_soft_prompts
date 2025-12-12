@@ -26,6 +26,11 @@ class BaseModel(nn.Module):
   Attributes:
       model_type: 模型类型
       weight_decay: 权重衰减系数
+
+  Notes:
+       包含编码器（self.encoder，如 RoBERTa/DeBERTa）、dropout 层（self.dropout）、全连接层（self.dense）、
+         激活函数（self.gelu）、损失函数（self.criterion）、softmax（self.softmax）等基础组件；
+
   """
   def __init__(self, args, core, tokenizer):
     """
@@ -564,14 +569,43 @@ class CVAEModel(BaseModel):
 
 class DualClassifier(BaseModel):
   """
-  双标签分类模型，同时预测 intent（意图）和 slot（槽位）
+  双标签分类模型（DualClassifier），同时预测 intent（意图）和 slot（槽位），损失求和训练；
+    目标是共享编码器和隐藏层参数，同时完成两个分类任务：
+    - intent（意图分类）：粗粒度的对话意图判断（如 “查询天气”“订机票”）；
+    - slot（槽位分类）：细粒度的实体 / 属性提取（如 “时间”“地点”“金额”）；
+  通过共享底层参数降低模型参数量，同时将两个任务的损失求和进行联合训练，适配对话系统的核心需求。
+
+  Notes:
+      模型选型：根据args.size自动选择编码器类型（小 / 中型用 RoBERTa，其他用 DeBERTa）；
+      核心设计：“共享编码器 + 双分类头”，是多任务学习中 “参数共享” 的经典范式，兼顾效率和任务关联性。
   """
   # Model for predicting both intents and slots at once
-  def __init__(self, args, core, tokenizer, primary_size, secondary_size):
+  def __init__(
+      self,
+      args,
+      core,
+      tokenizer,
+      primary_size,
+      secondary_size
+  ):
+    """
+    继承父类BaseModel，复用编码器、激活函数、损失函数等基础组件；
+    动态选择编码器类型（适配不同规模的预训练模型）；
+    定义两个独立的线性分类头，分别对应 intent 和 slot 任务，共享底层参数但任务输出层分离。
+
+    Args:
+        args: 配置参数（如 hidden_size 隐藏层维度、size 模型规模）
+        core: 核心模型组件（通常是预训练编码器）
+        tokenizer: 分词器（RoBERTa/DeBERTa tokenizer）
+        primary_size: 主分类的类别数（intent 任务分类头数）
+        secondary_size: 次分类的类别数（slot 任务分类头数）
+    """
     super().__init__(args, core, tokenizer)
     self.name = 'dual-classify'
 
+    # 根据参数选择编码器类型（RoBERTa/DeBERTa）
     self.model_type = 'roberta' if args.size in ['small', 'medium'] else 'deberta'
+    # 定义双分类头：线性层实现分类（输入为隐藏层维度，输出为类别数）
     self.primary_classify = nn.Linear(args.hidden_size, primary_size)  # intent分类头
     self.secondary_classify = nn.Linear(args.hidden_size, secondary_size)  # slot分类头
 
@@ -581,31 +615,48 @@ class DualClassifier(BaseModel):
     双分类头分别预测意图（intent）和槽位（slot），损失求和训练；
     输出为字典格式，区分两个任务的预测结果，适配对话系统的核心需求
     Args:
-        inputs:
-        targets:
-        outcome:
+        inputs: 编码器输入（字典，包含 input_ids、attention_mask 等）
+        targets: 标签字典，包含'intent'和'slot'两个键，对应标签值
+        outcome: 输出类型（'logit'返回原始预测值，其他返回概率）
 
     Returns:
+        output: 字典，包含intent/slot的预测结果（logit/概率）
+        loss: 联合损失（intent_loss + slot_loss）
 
     """
     # 共享编码器，双分类头分别计算损失
     enc_out = self.encoder(**inputs, output_hidden_states=True)
+    # 取最后一层的第 0 个 token（CLS token）—— 这是 BERT/RoBERTa 类模型中用于句子级分类的核心特征，能表征整个输入序列的语义；
+    # 若任务是 “槽位标注”（序列级分类，如每个 token 对应一个槽位），通常会提取所有 token 的隐藏状态，
+    #   但此处代码提取 CLS token，说明该 slot 任务是句子级槽位分类（如整句的核心槽位），而非逐 token 标注。
     cls_token = enc_out['hidden_states'][-1][:, 0, :]
     # 共享隐藏层计算
+    # 两个分类任务共享这部分特征变换，大幅降低参数量（若分开设计，需两套隐藏层），
+    #   同时让 intent 和 slot 任务的特征相互关联（符合对话任务中 “意图决定槽位，槽位支撑意图” 的逻辑）。
     hidden1 = self.dropout(cls_token)
     hidden2 = self.dense(hidden1)
     hidden3 = self.gelu(hidden2)
     hidden4 = self.dropout(hidden3)
-    # 双分类头
+
+    # 双分类头与损失联合训练
+    # 两个线性分类头独立，但输入是同一特征hidden4，实现 “共享底层、分离顶层”；
     intent_logits = self.primary_classify(hidden4)
     slot_logits = self.secondary_classify(hidden4)         # batch_size, num_classes
-    # 损失求和
+
+    # 损失求和：loss = intent_loss + slot_loss，训练时梯度会同时更新编码器、共享隐藏层、两个分类头的参数，
+    #   让模型同时优化两个任务；
+    # 若两个任务的损失量级差异大，可加权重（如loss = 0.6*intent_loss + 0.4*slot_loss），代码中未体现，是简化版。
     intent_loss = self.criterion(intent_logits, targets['intent'])
     slot_loss = self.criterion(slot_logits, targets['slot'])
     loss = intent_loss + slot_loss
 
+    # 输出原始logit（训练时用，便于计算梯度）
+    # 训练阶段：outcome='logit'，返回原始 logit（未经过 softmax），
+    #   因为损失函数（如 CrossEntropyLoss）会自动对 logit 计算 softmax，避免重复计算；
     if outcome == 'logit':
       output = {'intent': intent_logits, 'slot': slot_logits}
+
+    # 推理阶段：outcome≠'logit'，返回 softmax 归一化后的概率，便于直接取最大概率作为预测类别。
     else:
       output = {'intent': self.softmax(intent_logits), 'slot': self.softmax(slot_logits)}
     return output, loss
