@@ -663,8 +663,13 @@ class DualClassifier(BaseModel):
 
 class GenerateModel(BaseModel):
   """
-  通用分类模型，简化版BaseModel
-  极简分类模型，直接用 CLS token 作为 logits，适用于快速验证
+  通用分类模型，直接用 CLS token 作为 logits，适用于快速验证
+
+  Notes:
+      特点：
+        - 直接使用 CLS token 的输出作为 logits，无需额外分类层
+        - 适用于快速验证模型架构和数据有效性
+        - 支持分类/回归任务（通过配置 task_type）
   """
   # Main model for general classification prediction
   def __init__(self, args, core, tokenizer):
@@ -672,6 +677,18 @@ class GenerateModel(BaseModel):
     self.name = 'generate'
 
   def forward(self, inputs, targets, outcome='logit'):
+    """
+
+    Args:
+        inputs: 模型输入字典，包含 input_ids, attention_mask 等
+        targets: 标签数据，shape [batch_size]
+        outcome: 输出类型，'logit'返回原始得分，'prob'返回概率
+
+    Returns:
+        output: logits 或概率值，shape [batch_size, hidden_dim]
+        loss: 损失值（如果 targets 不为 None）
+
+    """
     enc_out = self.encoder(**inputs)
     cls_token = enc_out['last_hidden_state'][:, 0, :]   # batch_size, embed_dim
     
@@ -682,40 +699,58 @@ class GenerateModel(BaseModel):
 
 class SentenceBERT(SentenceTransformer):
   """
-  扩展训练 / 相似度评估逻辑（qualify方法）
+  扩展训练 / 相似度评估逻辑
+  扩展了 qualify 方法，用于可视化句子间的余弦相似度，方便调试和验证句子嵌入（embedding）的效果
+
+  Notes:
+      SentenceBERT 继承自 SentenceTransformer（Sentence-BERT 官方库的核心类，用于生成句子嵌入），
+        因此拥有父类的所有能力（如加载预训练模型、生成嵌入等）。
+      这个 qualify 方法是 Sentence-BERT 模型的调试工具，通过随机抽样 + 相似度排序 + 可视化输出，
+        快速验证句子嵌入的语义表征能力，帮助开发者判断模型是否学到了合理的语义相似性关系。
   """
   def qualify(self, features, utterances):
     """
-    qualify方法：可视化句子相似度，便于调试和效果验证；
+    可视化句子相似度，便于调试和效果验证；
+    作用：通过随机选一个句子，计算它与所有其他句子的余弦相似度，
+           最终打印 “最相似的 3 个句子” 和 “最不相似的 3 个句子”，直观验证嵌入效果。
 
     Args:
-        features:
-        utterances:
+        features: 包含句子嵌入的字典，核心键是'sentence_embedding'，对应tensor类型的嵌入矩阵
+        utterances: 与嵌入对应的原始句子列表（字符串列表）
 
     Returns:
+        None（仅打印相似度结果，无返回值）
 
     """
+
     # 随机选一个句子，计算与其他句子的余弦相似度，输出最相似/最不相似的句子
     chosen_id = random.randint(0, len(utterances) - 1)
     chosen_utt = utterances[chosen_id]
+    # 取出目标句子的嵌入向量，并通过 unsqueeze(0) 增加一个维度（从 [d] 变为 [1, d]，
+    #   适配余弦相似度计算的维度要求）
     chosen_embed = features['sentence_embedding'][chosen_id].unsqueeze(0)
 
     comparables = []
     for sent_embed, utterance in zip(features['sentence_embedding'], utterances):
       with torch.no_grad():
+        # 计算目标句子嵌入与当前句子嵌入的余弦相似度（取值范围 [-1, 1]，值越大越相似）。
         score = torch.cosine_similarity(chosen_embed, sent_embed.unsqueeze(0))
       comp = (utterance, round(score.item(), 3))
       comparables.append(comp)
+    # 按相似度分数（元组的第二个元素）降序排序：分数最高的句子排在最前，最低的在最后。
     comparables.sort(key=lambda x: x[1], reverse=True)
 
+    # 打印结果（可视化）
     print("Target utterance:", chosen_utt)
     print(f"Out of {len(utterances)} utterances, the 3 closest are:")
     count = 1
+    # 最相似的 3 个句子：从 1 开始，因为最相似的是其本身，忽略
     for close, score in comparables[1:4]:
       print(f"   {count})", close, score)
       count += 1
     print(f"And the three furthest are:")
     count = 1
+    # 最不相似的 3 个句子
     for far, score in comparables[-3:]:
       print(f"   {count})", far, score)
       count += 1
@@ -741,7 +776,7 @@ class SentenceBERT(SentenceTransformer):
       args=None):
     """
     # 扩展训练逻辑：支持自定义损失函数、梯度裁剪、 checkpoint保存、训练中评估
-    # 核心改造：
+    # 核心：
     # 1. 优化器分组（区分weight decay）：对 bias/LayerNorm 不做 weight decay，提升训练稳定性。
     # 2. 训练中随机选批次做相似度评估（do_qual）；
     # 3. 自定义学习率调度器、梯度归一化；
@@ -769,17 +804,19 @@ class SentenceBERT(SentenceTransformer):
     :param evaluation_steps: If > 0 and do qualify print out the closest relations per batch
     :param output_path: Storage path for the model and evaluation files
     :param save_best_model: If true, the best model (according to evaluator) is stored at output_path
-    :param max_grad_norm: Used for gradient normalization.
-    :param callback: Callback function that is invoked after each evaluation.
+    :param max_grad_norm: 梯度裁剪的最大范数。Used for gradient normalization.
+    :param do_qual: 是否在训练中随机选批次做相似度评估
+    :param callback: 评估后回调函数，参数：(score, epoch, steps)。Callback function that is invoked after each evaluation.
         It must accept the following three parameters in this order:
         `score`, `epoch`, `steps`
     :param checkpoint_path: Folder to save checkpoints during training
-    :param checkpoint_save_steps: Will save a checkpoint after so many steps
-    :param checkpoint_save_total_limit: Total number of checkpoints to store
+    :param checkpoint_save_steps: Checkpoint保存步数间隔。Will save a checkpoint after so many steps
+    :param checkpoint_save_total_limit: 保留的Checkpoint最大数量（0表示不限制）。Total number of checkpoints to store
     """
 
     ##Add info to model card
     dataloader, loss_model = train_objective
+    # # 生成模型卡片信息
     info_loss_functions =  ModelCardTemplate.get_train_objective_info(dataloader, loss_model)
     info_loss_functions = "\n\n".join([text for text in info_loss_functions])
     eval_name = evaluator.__class__.__module__
@@ -791,14 +828,18 @@ class SentenceBERT(SentenceTransformer):
     print(info_fit_parameters)
     ifp = json.dumps(info_fit_parameters, indent=4, sort_keys=True)
 
+    # 更新模型卡片
     self._model_card_text = None
     self._model_card_vars['{TRAINING_SECTION}'] = ModelCardTemplate.__TRAINING_SECTION__.replace("{LOSS_FUNCTIONS}", info_loss_functions).replace("{FIT_PARAMETERS}", ifp)
     self.best_score = -9999999
+
     self.to(self._target_device)
     loss_model.to(self._target_device)
 
     # Use smart batching
+    # 使用智能批处理
     dataloader.collate_fn = self.smart_batching_collate
+    # 计算训练步数
     if steps_per_epoch is None or steps_per_epoch == 0:
       steps_per_epoch = len(dataloader)
     num_train_steps = int(steps_per_epoch * epochs)
@@ -806,6 +847,7 @@ class SentenceBERT(SentenceTransformer):
     # Prepare optimizers
     param_optimizer = list(loss_model.named_parameters())
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+    # 优化器分组（区分weight decay）
     optimizer_grouped_parameters = [
       {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': weight_decay},
       {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
@@ -814,18 +856,24 @@ class SentenceBERT(SentenceTransformer):
     scheduler = self._get_scheduler(optimizer, scheduler=scheduler_name, 
               warmup_steps=warmup_steps, t_total=num_train_steps)
 
+    # 训练状态初始化
     global_step = 0
     data_iterators = []
     tok = self._first_module().tokenizer
-    
+    # 修复：随机批次选择应基于dataloader长度
+    max_batch_idx = len(dataloader) - 1 if len(dataloader) > 0 else 0
     for epoch in progress_bar(range(epochs), desc="Epoch", total=epochs):
       training_steps = 0
       loss_model.zero_grad()
       loss_model.train()
-      chosen_batch = random.randint(0, 100-1) # len(dataloader)
+      chosen_batch = random.randint(0, max_batch_idx) # len(dataloader)
 
       losses = []
       for features, labels in dataloader:
+        # 终止条件：达到每轮步数限制
+        if training_steps>=steps_per_epoch:
+            break
+        # 标签类型转换（适配损失函数）
         if labels.dtype == torch.int64:
           labels = labels.type(torch.float32)
 
@@ -837,32 +885,40 @@ class SentenceBERT(SentenceTransformer):
         else:
           loss_value.backward()
 
+          # 梯度裁剪
           torch.nn.utils.clip_grad_norm_(loss_model.parameters(), max_grad_norm)
           optimizer.step()
           optimizer.zero_grad()
           scheduler.step()
 
+        # 步数更新
         training_steps += 1
         global_step += 1
 
+        # 日志打印
         if logging_steps > 0 and training_steps % logging_steps == 0:
           avg_loss = round(np.mean(losses), 3) 
           print(f"Step {training_steps}/{steps_per_epoch}, Loss: {avg_loss}")
+
+        # 保存Checkpoint
         if checkpoint_path is not None and checkpoint_save_steps > 0 and global_step % checkpoint_save_steps == 0:
           print("Saving checkpoint")
           self._save_checkpoint(checkpoint_path, checkpoint_save_total_limit, global_step)
+
+        # 相似度评估（随机批次）
         if do_qual and training_steps == chosen_batch:
           fzero = features[0]
           utterances = tok.batch_decode(fzero['input_ids'], skip_special_tokens=True)
+          self.qualify(fzero, utterances)
 
-      if do_qual:
-        self.qualify(fzero, utterances)
-      avg_loss = round(np.mean(losses), 3)
+      # 本轮训练结束：计算平均损失
+      avg_loss = round(np.mean(losses), 3) if losses else 0.0
       def caller(raw_score, epoch, steps):
         score = round(raw_score, 3)
         print(f"Step {steps}/{steps_per_epoch}, Loss: {avg_loss}, Score: {score}")
       self._eval_during_training(evaluator, output_path, save_best_model, epoch, training_steps, caller)
 
+    # 训练结束：保存最终Checkpoint
     if checkpoint_path is not None:
       self._save_checkpoint(checkpoint_path, checkpoint_save_total_limit, global_step)
 
