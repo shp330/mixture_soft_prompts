@@ -535,6 +535,7 @@ class CVAEModel(BaseModel):
     
   @staticmethod
   def from_pretrained(args, path, tokenizer):  
+    # 如果 path 不包含 'bert'（例如是本地保存的 .pt 文件）：
     if 'bert' not in path:
       prev_weights = torch.load(path)
       ckpt_name = prev_weights['ckpt_name']
@@ -547,13 +548,16 @@ class CVAEModel(BaseModel):
     encoder_config.vocab_size = len(tokenizer)
     encoder = BertModel(encoder_config)
     decoder_config = AutoConfig.from_pretrained(decoder_model_name)
-    decoder_config.hidden_size *= 2
-    decoder_config.is_decoder = True
-    decoder_config.add_cross_attention = True
+    decoder_config.hidden_size *= 2 # 将隐藏层维度翻倍（可能是为了匹配编码器输出 + 潜在变量拼接后的维度）。
+    decoder_config.is_decoder = True # 启用 decoder 模式（允许 attention mask 等）。
+    decoder_config.add_cross_attention = True # 添加 cross-attention 层，使解码器能关注编码器的输出（这是 Seq2Seq 架构的关键）
     decoder_config.vocab_size = len(tokenizer)
-    decoder = GPT2LMHeadModel(decoder_config)
+    decoder = GPT2LMHeadModel(decoder_config) # 实例化带语言模型头的 GPT-2：GPT2LMHeadModel。 这里只是随机初始化的 GPT-2，权重后续由 load_state_dict 加载。
+
     model = CVAEModel(args, encoder, decoder_config, decoder, tokenizer)
     if 'bert' not in path:
+      # 加载预训练权重（如果存在）
+      # 仅当从 checkpoint 加载时（即 path 不是原始 BERT 名称），才加载保存的模型状态字典。
       model.load_state_dict(prev_weights['model_state_dict'])
     model.to(device)
     return model
