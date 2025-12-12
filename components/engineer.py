@@ -51,6 +51,17 @@ class PromptEngineer(object):
       self.embedding_map[sample['uuid']] = sample
 
   def _overlap(self, source_constraints, target_constraints):
+    """
+    计算目标样本与候选示例的属性重叠度
+    Args:
+        source_constraints: 目标样本
+        target_constraints: 候选示例
+
+    Returns:
+        is_match (bool): 候选示例是否匹配
+        matches(int): 匹配度得分（如重叠属性数量）。
+
+    """
     matches = 0
     # there are no attributes to condition on
     if len(source_constraints) == 0:
